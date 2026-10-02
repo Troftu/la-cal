@@ -1,0 +1,9 @@
+[submodule "standard-and-references/sleet"]
+	path = standards-and-references/sleet
+	url = https://gitlab.com/open-arsenal/ams-gra/hello-world-sk/infra/sleet.git
+[submodule "standard-and-references/uci-standard"]
+	path = standards-and-references/uci-standard
+	url = https://gitlab.com/open-arsenal/uci/standard.git
+[submodule "standard-and-references/oms-standard"]
+	path = standards-and-references/oms-standard
+	url = https://gitlab.com/open-arsenal/oms/standard.git
