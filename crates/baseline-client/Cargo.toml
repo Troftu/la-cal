@@ -1,0 +1,26 @@
+# Adapted from SLEET e3c2d798a229766571ed7be1f5b28d2dcdb51868, 2026-10-04.
+# Temporary upstream-style client for baseline tests, not the final typed API.
+[package]
+name = "baseline-client"
+version = "0.1.0"
+edition = "2024"
+description = "SLEET-style OWP client used for adoption baseline tests"
+license = "Apache-2.0"
+repository = "https://github.com/Troftu/la-cal"
+keywords = ["oms", "uci", "cal", "owp"]
+categories = ["network-programming"]
+readme = "../../README.md"
+
+[dependencies]
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sleet-types = { package = "owp-types", path = "../owp-types" }
+tokio = { version = "1.53.2", features = ["net"] }
+tokio-tungstenite = "0.30"
+
+[dev-dependencies]
+tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "net", "time"] }
+
+[lints]
+workspace = true

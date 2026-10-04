@@ -1,0 +1,49 @@
+# Adapted from SLEET e3c2d798a229766571ed7be1f5b28d2dcdb51868, 2026-10-04.
+# Project paths/name and current stable dependencies; see ../../NOTICE.
+[package]
+name = "la-cal"
+version = "0.1.0"
+edition = "2024"
+description = "Project-owned OMS 2.5 LA-CAL server adoption baseline"
+license = "Apache-2.0"
+repository = "https://github.com/Troftu/la-cal"
+keywords = ["oms", "uci", "cal", "websocket"]
+categories = ["network-programming"]
+readme = "../../README.md"
+
+[features]
+default = []
+otlp = ["dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk", "dep:tonic", "dep:tracing-opentelemetry"]
+
+[dependencies]
+futures-util = "0.3"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+metrics-process = "2.4.3"
+opentelemetry = { version = "0.33", optional = true }
+opentelemetry-otlp = { version = "0.33", optional = true, features = ["grpc-tonic"] }
+opentelemetry_sdk = { version = "0.33", optional = true, features = ["rt-tokio"] }
+quick-xml = "0.42"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sleet-types = { package = "owp-types", path = "../owp-types" }
+tokio = { version = "1.53.2", features = ["full"] }
+tokio-tungstenite = "0.30"
+tokio-util = "0.7"
+toml = "1.1.6"
+tonic = { version = "0.14", optional = true }
+tracing = "0.1"
+tracing-opentelemetry = { version = "0.34", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["serde", "v5"] }
+
+[dev-dependencies]
+sleet-client = { package = "baseline-client", path = "../baseline-client" }
+tempfile = "3"
+
+[lints]
+workspace = true

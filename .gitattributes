@@ -1,0 +1,4 @@
+# Preserve authoritative UCI artifacts byte-for-byte, including upstream CRLF
+# and whitespace in documentation. Apply normal checks to authored code/docs.
+spec/002.5.0/*.xsd -text -whitespace
+spec/002.5.0/VDD.txt -text -whitespace

@@ -24,3 +24,30 @@ prototype. This entry records the design decision, not source-code changes.
 For each implemented adaptation, append its date, affected project files,
 upstream source files/revision, and a concise description of the changes.
 Keep prominent modification notices in the adapted source files as well.
+
+2026-10-04: Ticket 14 source adoption from the selected SLEET revision.
+  - sleet/src -> crates/la-cal/src: retained the OWP frontend, local router,
+    configuration, admin/telemetry, schema parser, facets, validator and tests.
+    main.rs identifies the project-owned executable as la-cal; server.rs adds
+    two targeted Clippy argument-count allowances without changing behavior.
+    schema/parser.rs uses quick-xml 0.42 UTF-8 names/attribute values instead
+    of the prior byte API. Other adopted source files are unmodified.
+  - sleet-types/src -> crates/owp-types/src: retained OWP types/tests and the
+    baseline UCI helper module/tests. uci/v2_5.rs was explicitly regenerated
+    from the pinned UCI inputs with the project-owned generator, adding
+    generator/schema provenance to its header.
+  - sleet-client/src -> crates/baseline-client/src: retained the upstream
+    client and tests unchanged as temporary baseline/test support; this is
+    not the final cloneable typed client selected by the prototype spec.
+  - scripts/generate_uci_types.py: retained default-root discovery/generation
+    and self-tests; added source/schema/terms provenance to generated output.
+  - Cargo.toml and crates/*/Cargo.toml: adapted workspace/package names and
+    paths, retained source import aliases, selected current stable dependency
+    releases and workspace resolver 3. Retained upstream lint policy with an
+    assert_is_empty allowance to avoid rewriting unchanged assertions.
+  - LICENSE and LICENSES/uci-schema/*: retained upstream terms/attribution.
+    UCI spec/002.5.0 inputs were extracted unchanged from revision
+    73a286fc4b881d9f328dbd64148525606a92c33a; see spec/002.5.0/PROVENANCE.md.
+
+The source-adoption baseline still uses SLEET's in-process router. It does
+not implement the selected Zenoh/Protobuf ASB or final typed client contract.

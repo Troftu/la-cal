@@ -1,0 +1,20 @@
+# Adapted from SLEET e3c2d798a229766571ed7be1f5b28d2dcdb51868, 2026-10-04.
+# Project paths/name; see ../../NOTICE.
+[package]
+name = "owp-types"
+version = "0.1.0"
+edition = "2024"
+description = "Adopted OWP protocol and baseline UCI helpers"
+license = "Apache-2.0"
+repository = "https://github.com/Troftu/la-cal"
+keywords = ["oms", "uci", "cal", "owp"]
+categories = ["network-programming"]
+readme = "../../README.md"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["serde"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,7 @@
+service_id = "baseline-tester"
+service_uuid = "123e4567-e89b-12d3-a456-426614174001"
+allowed_topics = ["baseline"]
+
+[[topic_bindings]]
+topic = "baseline"
+allowed_messages = ["ServiceStatus"]

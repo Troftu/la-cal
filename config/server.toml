@@ -1,0 +1,8 @@
+# Native ticket-14 baseline: paths are relative to the workspace root.
+bind_addr = "127.0.0.1:9000"
+server_id = "la-cal-baseline"
+system_label = "Native LA-CAL baseline"
+schema_path = "spec/002.5.0/UCI_MessageDefinitions_v2_5_0.xsd"
+schema_version = "002.5.0"
+system_uuid = "123e4567-e89b-12d3-a456-426614174000"
+services_dir = "config/services.d"
