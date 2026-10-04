@@ -1,0 +1,26 @@
+Third-party provenance and modification record
+=============================================
+
+SLEET
+-----
+Upstream: https://gitlab.com/open-arsenal/ams-gra/hello-world-sk/infra/sleet.git
+Selected source revision: e3c2d798a229766571ed7be1f5b28d2dcdb51868
+Upstream tag: v2026.09.01
+License: Apache License, Version 2.0
+Copyright (c) 2026-present U.S. Federal Government (in countries where recognized)
+
+The selected adaptation covers SLEET's OWP server frontend and local
+subscription/group routing, plus its UCI Rust binding generator. Retain the
+upstream license and applicable attribution in project-owned adaptations.
+UCI schema artifacts have separate provenance and terms; they are not
+relicensed under Apache-2.0 by using SLEET's generator.
+
+Modification record
+-------------------
+2026-10-03: Established this provenance and modification record following
+selection of a project-owned SLEET frontend adaptation for the native LA-CAL
+prototype. This entry records the design decision, not source-code changes.
+
+For each implemented adaptation, append its date, affected project files,
+upstream source files/revision, and a concise description of the changes.
+Keep prominent modification notices in the adapted source files as well.

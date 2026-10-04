@@ -1,0 +1,3 @@
+interface:
+  display_name: "OMS LA-CAL"
+  short_description: "Use local OMS, UCI, and SLEET references"
