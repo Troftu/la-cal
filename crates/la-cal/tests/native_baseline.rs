@@ -1,11 +1,11 @@
-//! Ticket-14 acceptance at the real process/WebSocket boundary.
+//! Native acceptance at the real process/WebSocket boundary (tickets 14–15).
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use sleet_types::owp::{ServerOp, parse_server};
+use sleet_types::owp::{OwpError, ServerOp, parse_server};
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -82,11 +82,12 @@ async fn native_process_negotiates_validates_and_delivers_service_status() {
         assert_eq!(info.server_id, "la-cal-baseline");
         assert_eq!(info.uuids.service, "123e4567-e89b-12d3-a456-426614174001");
         assert_eq!(info.uuids.system, "123e4567-e89b-12d3-a456-426614174000");
-        ws.send(Message::text("SUB status ServiceStatus baseline"))
+        assert_topic_policy(&mut ws, &fixture).await;
+        ws.send(Message::text("SUB status ServiceStatus ServiceStatus"))
             .await
             .unwrap();
         assert!(matches!(read_operation(&mut ws).await, ServerOp::Ok));
-        ws.send(Message::text(format!("PUB baseline {fixture}")))
+        ws.send(Message::text(format!("PUB ServiceStatus {fixture}")))
             .await
             .unwrap();
         let mut acknowledged = false;
@@ -114,6 +115,35 @@ async fn native_process_negotiates_validates_and_delivers_service_status() {
     })
     .await
     .expect("bounded OWP exchange");
+}
+
+async fn assert_topic_policy(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    fixture: &str,
+) {
+    for (sid, topic) in [
+        ("commands", "ServiceLifecycleCommand"),
+        ("results", "ServiceLifecycleCommandStatus"),
+    ] {
+        ws.send(Message::text(format!("SUB {sid} {topic} {topic}")))
+            .await
+            .unwrap();
+        assert!(matches!(read_operation(ws).await, ServerOp::Ok));
+        // The actual schema-valid ServiceStatus fixture cannot be sent on
+        // another message-type topic, even without its optional binding.
+        ws.send(Message::text(format!("PUB {topic} {fixture}")))
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_operation(ws).await,
+            ServerOp::Err {
+                error: OwpError::InvalidMessage,
+                details: Some(_)
+            }
+        ));
+    }
 }
 
 async fn read_operation(

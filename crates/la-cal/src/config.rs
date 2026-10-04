@@ -2,6 +2,9 @@
 //!
 //! This module defines the server and per-service configuration structures
 //! and provides the logic to load them from TOML files on disk.
+//!
+//! Modified 2026-10-04 from SLEET e3c2d798a229766571ed7be1f5b28d2dcdb51868:
+//! enforce the selected three-root topic policy. See ../../../NOTICE.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -12,6 +15,13 @@ use std::sync::Arc;
 use serde::Deserialize;
 use sleet_types::owp::validate_identifier;
 use uuid::Uuid;
+
+/// Supported UCI 002.5.0 topics, each bound to its identically named global root.
+pub const SUPPORTED_TOPICS: [&str; 3] = [
+    "ServiceLifecycleCommand",
+    "ServiceLifecycleCommandStatus",
+    "ServiceStatus",
+];
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -69,12 +79,22 @@ pub struct ServiceConfig {
     pub service_uuid: Uuid,
     /// Topics this service is authorized to PUB/SUB on.
     pub allowed_topics: Vec<String>,
-    /// Optional per-topic message type restrictions.
-    ///
-    /// Maps topic names to the set of OMS message names (global element names)
-    /// allowed on that topic. Topics absent from this map accept any schema-valid
-    /// message (permissive default).
+    /// Optional explicit bindings, validated to match the fixed topic/root policy.
+    /// Absence does not widen the supported message surface.
     pub topic_bindings: HashMap<String, HashSet<String>>,
+}
+
+impl ServiceConfig {
+    /// Whether a message matches the fixed topic/root policy and explicit binding.
+    /// Participant authorization is checked separately through `allowed_topics`.
+    pub fn allows_message(&self, topic: &str, message_name: &str) -> bool {
+        SUPPORTED_TOPICS.contains(&topic)
+            && message_name == topic
+            && self
+                .topic_bindings
+                .get(topic)
+                .is_none_or(|allowed| allowed.contains(message_name))
+    }
 }
 
 /// Top-level validated configuration containing server settings and services.
@@ -143,6 +163,12 @@ pub enum ConfigError {
     TopicBindingDuplicateTopic { path: PathBuf, topic: String },
     /// A `topic_bindings` entry has an empty `allowed_messages` list.
     TopicBindingEmptyMessages { path: PathBuf, topic: String },
+    /// A topic is outside the selected three-root surface.
+    UnsupportedTopic { path: PathBuf, topic: String },
+    /// The configuration requests a schema outside the selected profile.
+    UnsupportedSchemaVersion { path: PathBuf, version: String },
+    /// An explicit binding differs from the identically named root.
+    TopicBindingMismatch { path: PathBuf, topic: String },
 }
 
 impl fmt::Display for ConfigError {
@@ -254,6 +280,22 @@ impl fmt::Display for ConfigError {
                     topic
                 )
             }
+            Self::UnsupportedTopic { path, topic } => write!(
+                f,
+                "{}: unsupported topic '{topic}'; expected one of {}",
+                path.display(),
+                SUPPORTED_TOPICS.join(", ")
+            ),
+            Self::UnsupportedSchemaVersion { path, version } => write!(
+                f,
+                "{}: unsupported schema_version '{version}'; expected UCI 002.5.0",
+                path.display()
+            ),
+            Self::TopicBindingMismatch { path, topic } => write!(
+                f,
+                "{}: topic '{topic}' must bind only its identically named UCI 002.5.0 root",
+                path.display()
+            ),
         }
     }
 }
@@ -409,6 +451,12 @@ fn load_server_with_env(
 
     let schema_version =
         require_field(raw.schema_version.as_ref(), "schema_version", server_path)?.to_owned();
+    if schema_version != "002.5.0" {
+        return Err(ConfigError::UnsupportedSchemaVersion {
+            path: server_path.to_path_buf(),
+            version: schema_version,
+        });
+    }
 
     let namespace_uuid_str = env_namespace
         .or_else(|| raw.namespace_uuid.clone())
@@ -619,6 +667,23 @@ fn load_single_service(path: &Path) -> Result<ServiceConfig, ConfigError> {
 
     let topic_bindings = parse_topic_bindings(raw.topic_bindings, &allowed_topics, path)?;
 
+    for topic in &allowed_topics {
+        if !SUPPORTED_TOPICS.contains(&topic.as_str()) {
+            return Err(ConfigError::UnsupportedTopic {
+                path: path.to_path_buf(),
+                topic: topic.clone(),
+            });
+        }
+    }
+    for (topic, messages) in &topic_bindings {
+        if messages.len() != 1 || !messages.contains(topic) {
+            return Err(ConfigError::TopicBindingMismatch {
+                path: path.to_path_buf(),
+                topic: topic.clone(),
+            });
+        }
+    }
+
     Ok(ServiceConfig {
         service_id,
         service_uuid,
@@ -797,7 +862,7 @@ mod tests {
                 "svc1.toml",
                 "service_id = \"svc1\"\n\
                  service_uuid = \"550e8400-e29b-41d4-a716-446655440001\"\n\
-                 allowed_topics = [\"mission\"]\n",
+                 allowed_topics = [\"ServiceStatus\"]\n",
             );
         }
     }
@@ -828,6 +893,55 @@ mod tests {
     // -- Valid loading --
 
     #[test]
+    fn unsupported_topic_configuration_is_rejected() {
+        for topic in ["mission", "ServiceStatus.svc1", "ServiceStatus-svc1", "*"] {
+            let fix = TestFixture::new();
+            let server_path = fix.write_server("");
+            fix.write_service(
+                "svc1.toml",
+                &format!(
+                    "service_id = \"svc1\"\nservice_uuid = \"550e8400-e29b-41d4-a716-446655440001\"\nallowed_topics = [\"{topic}\"]\n"
+                ),
+            );
+            assert!(load(&server_path).is_err(), "unsupported topic {topic}");
+        }
+    }
+
+    #[test]
+    fn explicit_bindings_cannot_widen_or_replace_the_fixed_root() {
+        for messages in [
+            "\"ServiceLifecycleCommand\"",
+            "\"UnsupportedRoot\"",
+            "\"ServiceStatus\", \"ServiceLifecycleCommand\"",
+        ] {
+            let fix = TestFixture::new();
+            let server_path = fix.write_server("");
+            fix.write_service("svc1.toml", &format!(
+                "service_id = \"svc1\"\nservice_uuid = \"550e8400-e29b-41d4-a716-446655440001\"\nallowed_topics = [\"ServiceStatus\"]\n[[topic_bindings]]\ntopic = \"ServiceStatus\"\nallowed_messages = [{messages}]\n"
+            ));
+            assert!(matches!(
+                load(&server_path),
+                Err(ConfigError::TopicBindingMismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn configuration_rejects_other_schema_profiles() {
+        let fix = TestFixture::new();
+        let path = fix.write_server("");
+        let text = fs::read_to_string(&path)
+            .unwrap()
+            .replace("002.5.0", "002.6.0");
+        fs::write(&path, text).unwrap();
+        fix.write_default_service();
+        assert!(matches!(
+            load(&path),
+            Err(ConfigError::UnsupportedSchemaVersion { .. })
+        ));
+    }
+
+    #[test]
     fn load_valid_server_one_service() {
         let fix = TestFixture::new();
         let server_path = fix.write_server("");
@@ -835,7 +949,7 @@ mod tests {
             "svc1.toml",
             "service_id = \"tracker\"\n\
              service_uuid = \"550e8400-e29b-41d4-a716-446655440001\"\n\
-             allowed_topics = [\"mission\", \"tracks\"]\n",
+             allowed_topics = [\"ServiceStatus\", \"ServiceLifecycleCommand\"]\n",
         );
 
         let cfg = load(&server_path).unwrap();
@@ -844,7 +958,10 @@ mod tests {
         assert_eq!(cfg.server.schema_version, "002.5.0");
         assert_eq!(cfg.services.len(), 1);
         assert_eq!(cfg.services[0].service_id, "tracker");
-        assert_eq!(cfg.services[0].allowed_topics, vec!["mission", "tracks"]);
+        assert_eq!(
+            cfg.services[0].allowed_topics,
+            vec!["ServiceStatus", "ServiceLifecycleCommand"]
+        );
     }
 
     #[test]
@@ -855,13 +972,13 @@ mod tests {
             "svc1.toml",
             "service_id = \"svc-a\"\n\
              service_uuid = \"550e8400-e29b-41d4-a716-446655440001\"\n\
-             allowed_topics = [\"topic1\"]\n",
+             allowed_topics = [\"ServiceStatus\"]\n",
         );
         fix.write_service(
             "svc2.toml",
             "service_id = \"svc-b\"\n\
              service_uuid = \"550e8400-e29b-41d4-a716-446655440002\"\n\
-             allowed_topics = [\"topic2\", \"topic3\"]\n",
+             allowed_topics = [\"ServiceLifecycleCommand\", \"ServiceLifecycleCommandStatus\"]\n",
         );
 
         let cfg = load(&server_path).unwrap();
@@ -1312,13 +1429,13 @@ mod tests {
             "svc1.toml",
             "service_id = \"same-id\"\n\
              service_uuid = \"550e8400-e29b-41d4-a716-446655440001\"\n\
-             allowed_topics = [\"t\"]\n",
+             allowed_topics = [\"ServiceStatus\"]\n",
         );
         fix.write_service(
             "svc2.toml",
             "service_id = \"same-id\"\n\
              service_uuid = \"550e8400-e29b-41d4-a716-446655440002\"\n\
-             allowed_topics = [\"t\"]\n",
+             allowed_topics = [\"ServiceStatus\"]\n",
         );
         let result = load(&server_path);
         assert!(matches!(
@@ -1335,13 +1452,13 @@ mod tests {
             "svc1.toml",
             "service_id = \"svc-a\"\n\
              service_uuid = \"550e8400-e29b-41d4-a716-446655440001\"\n\
-             allowed_topics = [\"t\"]\n",
+             allowed_topics = [\"ServiceStatus\"]\n",
         );
         fix.write_service(
             "svc2.toml",
             "service_id = \"svc-b\"\n\
              service_uuid = \"550e8400-e29b-41d4-a716-446655440001\"\n\
-             allowed_topics = [\"t\"]\n",
+             allowed_topics = [\"ServiceStatus\"]\n",
         );
         let result = load(&server_path);
         assert!(matches!(
@@ -1679,7 +1796,7 @@ mod tests {
             "svc1.toml",
             "service_id = \"svc1\"\n\
              service_uuid = \"550e8400-e29b-41d4-a716-446655440001\"\n\
-             allowed_topics = [\"mission\"]\n",
+             allowed_topics = [\"ServiceStatus\"]\n",
         );
 
         let cfg = load(&server_path).unwrap();
@@ -1694,20 +1811,19 @@ mod tests {
             "svc1.toml",
             "service_id = \"svc1\"\n\
              service_uuid = \"550e8400-e29b-41d4-a716-446655440001\"\n\
-             allowed_topics = [\"mission\"]\n\
+             allowed_topics = [\"ServiceStatus\"]\n\
              \n\
              [[topic_bindings]]\n\
-             topic = \"mission\"\n\
-             allowed_messages = [\"Msg\", \"Track\"]\n",
+             topic = \"ServiceStatus\"\n\
+             allowed_messages = [\"ServiceStatus\"]\n",
         );
 
         let cfg = load(&server_path).unwrap();
         let bindings = &cfg.services[0].topic_bindings;
         assert_eq!(bindings.len(), 1);
-        let msgs = bindings.get("mission").unwrap();
-        assert!(msgs.contains("Msg"));
-        assert!(msgs.contains("Track"));
-        assert_eq!(msgs.len(), 2);
+        let msgs = bindings.get("ServiceStatus").unwrap();
+        assert!(msgs.contains("ServiceStatus"));
+        assert_eq!(msgs.len(), 1);
     }
 
     #[test]
@@ -1718,22 +1834,22 @@ mod tests {
             "svc1.toml",
             "service_id = \"svc1\"\n\
              service_uuid = \"550e8400-e29b-41d4-a716-446655440001\"\n\
-             allowed_topics = [\"mission\", \"tracks\"]\n\
+             allowed_topics = [\"ServiceStatus\", \"ServiceLifecycleCommand\"]\n\
              \n\
              [[topic_bindings]]\n\
-             topic = \"mission\"\n\
-             allowed_messages = [\"Msg\"]\n\
+             topic = \"ServiceStatus\"\n\
+             allowed_messages = [\"ServiceStatus\"]\n\
              \n\
              [[topic_bindings]]\n\
-             topic = \"tracks\"\n\
-             allowed_messages = [\"Track\"]\n",
+             topic = \"ServiceLifecycleCommand\"\n\
+             allowed_messages = [\"ServiceLifecycleCommand\"]\n",
         );
 
         let cfg = load(&server_path).unwrap();
         let bindings = &cfg.services[0].topic_bindings;
         assert_eq!(bindings.len(), 2);
-        assert!(bindings.contains_key("mission"));
-        assert!(bindings.contains_key("tracks"));
+        assert!(bindings.contains_key("ServiceStatus"));
+        assert!(bindings.contains_key("ServiceLifecycleCommand"));
     }
 
     #[test]

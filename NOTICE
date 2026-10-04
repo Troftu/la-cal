@@ -49,5 +49,25 @@ Keep prominent modification notices in the adapted source files as well.
     UCI spec/002.5.0 inputs were extracted unchanged from revision
     73a286fc4b881d9f328dbd64148525606a92c33a; see spec/002.5.0/PROVENANCE.md.
 
-The source-adoption baseline still uses SLEET's in-process router. It does
+2026-10-04: Ticket 15 topic-policy adaptation from the same selected revision.
+  - crates/la-cal/src/config.rs (sleet/src/config.rs): restrict configured
+    topics to the three selected message roots and schema version to 002.5.0;
+    reject explicit bindings that widen or replace the fixed topic/root pair.
+    Adapt successful configuration fixtures and add policy rejection checks.
+  - crates/la-cal/src/server.rs (sleet/src/server.rs): enforce exact supported
+    PUB and SUB topic/root pairs even when optional bindings are absent. PUB
+    mismatches/unsupported roots yield Invalid-Message with details; preserve
+    authorization and subscription errors. Adapt copied synthetic-schema socket
+    fixtures, bound OWP test reads and add focused fan-out/group/rejection tests.
+  - crates/la-cal/src/router.rs (sleet/src/router.rs): adapt selected tests to
+    message-type topics, verify one matching group member per publication
+    without requiring round-robin selection, and check connection-owned cleanup
+    leaves same-SID ordinary/group registrations on other connections intact.
+    Production router behavior is retained at this milestone.
+  - config/services.d/baseline.toml and crates/la-cal/tests/native_baseline.rs:
+    move the native exchange to ServiceStatus, authorize/subscribe to all three
+    selected topics, reject cross-topic real-schema publications, then verify
+    the connection remains usable and original-byte delivery succeeds.
+
+The topic-policy milestone still uses SLEET's in-process router. It does
 not implement the selected Zenoh/Protobuf ASB or final typed client contract.

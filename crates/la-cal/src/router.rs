@@ -1,4 +1,8 @@
 //! Message router for fan-out delivery of OMS messages to subscribers.
+//!
+//! Modified 2026-10-04 from SLEET e3c2d798a229766571ed7be1f5b28d2dcdb51868:
+//! adapt selected routing tests to message-type topics and avoid a mandated
+//! round-robin test oracle. See ../../../NOTICE.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -396,8 +400,8 @@ mod tests {
             .subscribe(Subscription {
                 sid: "s1".to_owned(),
                 connection_id: 1,
-                topic: "mission".to_owned(),
-                message_name: "AccessAssessment".to_owned(),
+                topic: "ServiceStatus".to_owned(),
+                message_name: "ServiceStatus".to_owned(),
                 group: None,
                 sender: tx,
             })
@@ -405,14 +409,14 @@ mod tests {
             .unwrap();
 
         router
-            .publish("mission", "AccessAssessment", "{\"AccessAssessment\":{}}")
+            .publish("ServiceStatus", "ServiceStatus", "{\"ServiceStatus\":{}}")
             .await;
 
         let msg = rx.recv().await.unwrap();
         match msg {
             ServerOp::Msg { sid, payload } => {
                 assert_eq!(sid, "s1");
-                assert_eq!(&*payload, "{\"AccessAssessment\":{}}");
+                assert_eq!(&*payload, "{\"ServiceStatus\":{}}");
             }
             other => panic!("expected MSG, got {other:?}"),
         }
@@ -440,7 +444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn group_round_robin() {
+    async fn group_receives_one_copy_per_publication() {
         let router = Router::new();
         let (tx1, mut rx1) = mpsc::channel(4);
         let (tx2, mut rx2) = mpsc::channel(4);
@@ -449,8 +453,8 @@ mod tests {
             .subscribe(Subscription {
                 sid: "a".to_owned(),
                 connection_id: 1,
-                topic: "mission".to_owned(),
-                message_name: "Msg".to_owned(),
+                topic: "ServiceStatus".to_owned(),
+                message_name: "ServiceStatus".to_owned(),
                 group: Some("g1".to_owned()),
                 sender: tx1,
             })
@@ -461,30 +465,27 @@ mod tests {
             .subscribe(Subscription {
                 sid: "b".to_owned(),
                 connection_id: 2,
-                topic: "mission".to_owned(),
-                message_name: "Msg".to_owned(),
+                topic: "ServiceStatus".to_owned(),
+                message_name: "ServiceStatus".to_owned(),
                 group: Some("g1".to_owned()),
                 sender: tx2,
             })
             .await
             .unwrap();
 
-        router.publish("mission", "Msg", "{\"n\":1}").await;
-        router.publish("mission", "Msg", "{\"n\":2}").await;
-
-        let mut a_count = 0;
-        while rx1.try_recv().is_ok() {
-            a_count += 1;
+        for payload in ["{\"n\":1}", "{\"n\":2}"] {
+            router
+                .publish("ServiceStatus", "ServiceStatus", payload)
+                .await;
+            let deliveries: Vec<_> = [rx1.try_recv().ok(), rx2.try_recv().ok()]
+                .into_iter()
+                .flatten()
+                .collect();
+            assert_eq!(deliveries.len(), 1);
+            assert!(
+                matches!(&deliveries[0], ServerOp::Msg { payload: received, .. } if &**received == payload)
+            );
         }
-
-        let mut b_count = 0;
-        while rx2.try_recv().is_ok() {
-            b_count += 1;
-        }
-
-        assert_eq!(a_count + b_count, 2);
-        assert_eq!(a_count, 1);
-        assert_eq!(b_count, 1);
     }
 
     #[tokio::test]
@@ -560,8 +561,8 @@ mod tests {
             .subscribe(Subscription {
                 sid: "shared".to_owned(),
                 connection_id: 1,
-                topic: "mission".to_owned(),
-                message_name: "Msg".to_owned(),
+                topic: "ServiceStatus".to_owned(),
+                message_name: "ServiceStatus".to_owned(),
                 group: None,
                 sender: tx1,
             })
@@ -571,20 +572,24 @@ mod tests {
             .subscribe(Subscription {
                 sid: "shared".to_owned(),
                 connection_id: 2,
-                topic: "mission".to_owned(),
-                message_name: "Msg".to_owned(),
+                topic: "ServiceStatus".to_owned(),
+                message_name: "ServiceStatus".to_owned(),
                 group: None,
                 sender: tx2,
             })
             .await
             .unwrap();
 
-        router.publish("mission", "Msg", "{\"n\":1}").await;
+        router
+            .publish("ServiceStatus", "ServiceStatus", "{\"n\":1}")
+            .await;
         assert!(matches!(rx1.recv().await, Some(ServerOp::Msg { sid, .. }) if sid == "shared"));
         assert!(matches!(rx2.recv().await, Some(ServerOp::Msg { sid, .. }) if sid == "shared"));
 
         router.unsubscribe(1, "shared").await.unwrap();
-        router.publish("mission", "Msg", "{\"n\":2}").await;
+        router
+            .publish("ServiceStatus", "ServiceStatus", "{\"n\":2}")
+            .await;
 
         assert!(rx1.try_recv().is_err());
         assert!(matches!(rx2.recv().await, Some(ServerOp::Msg { sid, .. }) if sid == "shared"));
@@ -676,6 +681,46 @@ mod tests {
         router.remove_connection(42).await;
         router.publish("mission", "Msg", "{}").await;
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn cleanup_preserves_other_connections_with_same_sids_and_group() {
+        let router = Router::new();
+        let (removed_tx, mut removed_rx) = mpsc::channel(4);
+        let (remaining_tx, mut remaining_rx) = mpsc::channel(4);
+        for (connection_id, sender) in [(1, removed_tx), (2, remaining_tx)] {
+            for (sid, group) in [("ordinary", None), ("grouped", Some("workers"))] {
+                router
+                    .subscribe(Subscription {
+                        sid: sid.to_owned(),
+                        connection_id,
+                        topic: "ServiceStatus".to_owned(),
+                        message_name: "ServiceStatus".to_owned(),
+                        group: group.map(str::to_owned),
+                        sender: sender.clone(),
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+        router.remove_connection(1).await;
+        router
+            .publish("ServiceStatus", "ServiceStatus", "{\"ServiceStatus\":{}}")
+            .await;
+        assert!(removed_rx.try_recv().is_err());
+        let mut sids = HashSet::new();
+        for _ in 0..2 {
+            let ServerOp::Msg { sid, payload } = remaining_rx
+                .try_recv()
+                .expect("surviving subscription receives")
+            else {
+                panic!("expected message");
+            };
+            assert_eq!(&*payload, "{\"ServiceStatus\":{}}");
+            assert!(sids.insert(sid));
+        }
+        assert_eq!(sids, ["ordinary".to_owned(), "grouped".to_owned()].into());
+        assert!(remaining_rx.try_recv().is_err());
     }
 
     #[tokio::test]

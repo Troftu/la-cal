@@ -2,7 +2,9 @@
 //! state machine handling INIT, PUB, SUB, UNSUB operations.
 //!
 //! Modified 2026-10-04 from SLEET e3c2d798a229766571ed7be1f5b28d2dcdb51868:
-//! annotate inherited handler argument counts for current Clippy. See ../../../NOTICE.
+//! annotate inherited handler argument counts for current Clippy; enforce fixed
+//! topic/root pairs independently of optional bindings and adapt socket tests.
+//! See ../../../NOTICE.
 
 use std::fmt;
 use std::sync::Arc;
@@ -24,7 +26,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
-use crate::config::{Config, ServiceConfig};
+use crate::config::{Config, SUPPORTED_TOPICS, ServiceConfig};
 use crate::router::{Router, RouterError, Subscription};
 use crate::schema::model::Schema;
 use crate::validator::validate_oms_json;
@@ -691,14 +693,12 @@ async fn process_pub(
         if let serde_json::Value::Object(root) = &value
             && root.len() == 1
             && let Some((message_name, _)) = root.iter().next()
-            && let Some(allowed) = service.topic_bindings.get(&topic)
-            && !allowed.contains(message_name)
-            && schema.global_elements.contains_key(message_name)
+            && !service.allows_message(&topic, message_name)
         {
             return Err((
                 "topic_binding",
-                OwpError::IllegalState,
-                format!("message type {message_name} not allowed on topic {topic}"),
+                OwpError::InvalidMessage,
+                format!("topic {topic} requires its identically named supported UCI 002.5.0 root; received {message_name}"),
             ));
         }
 
@@ -768,16 +768,19 @@ async fn process_sub(
         ));
     }
 
-    if !schema.is_global_element(&req.message_name) {
+    if !SUPPORTED_TOPICS.contains(&req.message_name.as_str())
+        || !schema.is_global_element(&req.message_name)
+    {
         return Err((
             OwpError::IllegalArgument,
-            format!("unknown message name {}", req.message_name),
+            format!(
+                "unsupported message name {} for UCI 002.5.0",
+                req.message_name
+            ),
         ));
     }
 
-    if let Some(allowed) = service.topic_bindings.get(&req.topic)
-        && !allowed.contains(&req.message_name)
-    {
+    if !service.allows_message(&req.topic, &req.message_name) {
         return Err((
             OwpError::IllegalState,
             format!(
@@ -1012,14 +1015,16 @@ mod tests {
   <xs:complexType name="MsgType">
     <xs:sequence/>
   </xs:complexType>
-  <xs:element name="Msg" type="MsgType"/>
+  <xs:element name="ServiceStatus" type="MsgType"/>
 
   <xs:complexType name="DetailedType">
     <xs:sequence>
       <xs:element name="Id" type="xs:string" minOccurs="1" maxOccurs="1"/>
     </xs:sequence>
   </xs:complexType>
-  <xs:element name="DetailedMsg" type="DetailedType"/>
+  <xs:element name="ServiceLifecycleCommand" type="DetailedType"/>
+  <xs:element name="ServiceLifecycleCommandStatus" type="MsgType"/>
+  <xs:element name="UnsupportedRoot" type="MsgType"/>
 </xs:schema>"#,
         )
         .expect("write schema");
@@ -1027,15 +1032,15 @@ mod tests {
         let svc_defs: &[(&str, &str)] = &[
             (
                 "svc1.toml",
-                "service_id = \"svc1\"\nservice_uuid = \"550e8400-e29b-41d4-a716-446655440001\"\nallowed_topics = [\"mission\"]\n",
+                "service_id = \"svc1\"\nservice_uuid = \"550e8400-e29b-41d4-a716-446655440001\"\nallowed_topics = [\"ServiceStatus\", \"ServiceLifecycleCommand\"]\n",
             ),
             (
                 "svc2.toml",
-                "service_id = \"svc2\"\nservice_uuid = \"550e8400-e29b-41d4-a716-446655440002\"\nallowed_topics = [\"mission\"]\n",
+                "service_id = \"svc2\"\nservice_uuid = \"550e8400-e29b-41d4-a716-446655440002\"\nallowed_topics = [\"ServiceStatus\", \"ServiceLifecycleCommand\"]\n",
             ),
             (
                 "svc3.toml",
-                "service_id = \"svc3\"\nservice_uuid = \"550e8400-e29b-41d4-a716-446655440003\"\nallowed_topics = [\"other\"]\n",
+                "service_id = \"svc3\"\nservice_uuid = \"550e8400-e29b-41d4-a716-446655440003\"\nallowed_topics = [\"ServiceLifecycleCommandStatus\"]\n",
             ),
         ];
 
@@ -1144,7 +1149,10 @@ mod tests {
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
     ) -> String {
-        match ws.next().await {
+        match timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("bounded OWP response")
+        {
             Some(Ok(Message::Text(text))) => text.to_string(),
             other => panic!("expected text message, got {other:?}"),
         }
@@ -1194,6 +1202,33 @@ mod tests {
             resp,
             ServerOp::Err { error, .. } if error.to_string() == expected.to_string()
         ));
+    }
+
+    async fn expect_publication_delivery(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        expected_sid: &str,
+        expected_payload: &str,
+    ) {
+        let mut acknowledged = false;
+        let mut delivered = false;
+        for _ in 0..2 {
+            match recv_parsed(ws).await {
+                ServerOp::Ok => {
+                    assert!(!acknowledged, "duplicate publication acknowledgment");
+                    acknowledged = true;
+                }
+                ServerOp::Msg { sid, payload } => {
+                    assert_eq!(sid, expected_sid);
+                    assert_eq!(&*payload, expected_payload);
+                    assert!(!delivered, "duplicate delivery");
+                    delivered = true;
+                }
+                other => panic!("expected acknowledgment or delivery, got {other:?}"),
+            }
+        }
+        assert!(acknowledged && delivered);
     }
 
     #[tokio::test]
@@ -1417,12 +1452,12 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         let mut ws = connect_with_owp(port).await;
         init_verbose(&mut ws, "svc1").await;
 
-        ws.send(Message::Text("PUB mission {not json}".into()))
+        ws.send(Message::Text("PUB ServiceStatus {not json}".into()))
             .await
             .expect("send pub");
         expect_err(&mut ws, OwpError::InvalidMessage).await;
 
-        ws.send(Message::Text("SUB s1 Msg mission".into()))
+        ws.send(Message::Text("SUB s1 ServiceStatus ServiceStatus".into()))
             .await
             .expect("send sub");
         assert!(matches!(recv_parsed(&mut ws).await, ServerOp::Ok));
@@ -1436,12 +1471,12 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         let mut ws = connect_with_owp(port).await;
         init_verbose(&mut ws, "svc1").await;
 
-        ws.send(Message::Text("PUB mission {\"Unknown\":{}}".into()))
+        ws.send(Message::Text("PUB ServiceStatus {\"Unknown\":{}}".into()))
             .await
             .expect("send pub");
         expect_err(&mut ws, OwpError::InvalidMessage).await;
 
-        ws.send(Message::Text("SUB s1 Msg mission".into()))
+        ws.send(Message::Text("SUB s1 ServiceStatus ServiceStatus".into()))
             .await
             .expect("send sub");
         assert!(matches!(recv_parsed(&mut ws).await, ServerOp::Ok));
@@ -1455,12 +1490,14 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         let mut ws = connect_with_owp(port).await;
         init_verbose(&mut ws, "svc1").await;
 
-        ws.send(Message::Text("PUB mission {\"DetailedMsg\":{}}".into()))
-            .await
-            .expect("send pub");
+        ws.send(Message::Text(
+            "PUB ServiceLifecycleCommand {\"ServiceLifecycleCommand\":{}}".into(),
+        ))
+        .await
+        .expect("send pub");
         expect_err(&mut ws, OwpError::InvalidMessage).await;
 
-        ws.send(Message::Text("SUB s1 Msg mission".into()))
+        ws.send(Message::Text("SUB s1 ServiceStatus ServiceStatus".into()))
             .await
             .expect("send sub");
         assert!(matches!(recv_parsed(&mut ws).await, ServerOp::Ok));
@@ -1474,17 +1511,19 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         let mut ws = connect_with_owp(port).await;
         init_verbose(&mut ws, "svc1").await;
 
-        ws.send(Message::Text("PUB other {\"Msg\":{}}".into()))
-            .await
-            .expect("send pub");
+        ws.send(Message::Text(
+            "PUB ServiceLifecycleCommandStatus {\"ServiceLifecycleCommandStatus\":{}}".into(),
+        ))
+        .await
+        .expect("send pub");
         let resp = recv_parsed(&mut ws).await;
         assert!(matches!(
             resp,
             ServerOp::Err { error, details } if error.to_string() == OwpError::IllegalState.to_string()
-                && details == Some("service 'svc1' is not authorized to publish to topic other".to_string())
+                && details == Some("service 'svc1' is not authorized to publish to topic ServiceLifecycleCommandStatus".to_string())
         ));
 
-        ws.send(Message::Text("SUB s1 Msg mission".into()))
+        ws.send(Message::Text("SUB s1 ServiceStatus ServiceStatus".into()))
             .await
             .expect("send sub");
         assert!(matches!(recv_parsed(&mut ws).await, ServerOp::Ok));
@@ -1498,7 +1537,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             None,
             &[(
                 "svc1.toml",
-                "\n[[topic_bindings]]\ntopic = \"mission\"\nallowed_messages = [\"Msg\"]\n",
+                "\n[[topic_bindings]]\ntopic = \"ServiceStatus\"\nallowed_messages = [\"ServiceStatus\"]\n",
             )],
         )
         .await;
@@ -1506,9 +1545,11 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         let mut ws = connect_with_owp(port).await;
         init_verbose(&mut ws, "svc1").await;
 
-        ws.send(Message::Text("SUB s1 DetailedMsg mission".into()))
-            .await
-            .expect("send sub");
+        ws.send(Message::Text(
+            "SUB s1 ServiceLifecycleCommand ServiceStatus".into(),
+        ))
+        .await
+        .expect("send sub");
 
         expect_err(&mut ws, OwpError::IllegalState).await;
 
@@ -1521,7 +1562,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             None,
             &[(
                 "svc1.toml",
-                "\n[[topic_bindings]]\ntopic = \"mission\"\nallowed_messages = [\"Msg\"]\n",
+                "\n[[topic_bindings]]\ntopic = \"ServiceStatus\"\nallowed_messages = [\"ServiceStatus\"]\n",
             )],
         )
         .await;
@@ -1529,7 +1570,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         let mut ws = connect_with_owp(port).await;
         init_verbose(&mut ws, "svc1").await;
 
-        ws.send(Message::Text("SUB s1 Nope mission".into()))
+        ws.send(Message::Text("SUB s1 Nope ServiceStatus".into()))
             .await
             .expect("send sub");
 
@@ -1544,17 +1585,19 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         let mut ws = connect_with_owp(port).await;
         init_verbose(&mut ws, "svc1").await;
 
-        ws.send(Message::Text("SUB s1 Msg other".into()))
-            .await
-            .expect("send sub");
+        ws.send(Message::Text(
+            "SUB s1 ServiceLifecycleCommandStatus ServiceLifecycleCommandStatus".into(),
+        ))
+        .await
+        .expect("send sub");
         let resp = recv_parsed(&mut ws).await;
         assert!(matches!(
             resp,
             ServerOp::Err { error, details } if error.to_string() == OwpError::IllegalState.to_string()
-                && details == Some("service 'svc1' is not authorized to subscribe to topic other".to_string())
+                && details == Some("service 'svc1' is not authorized to subscribe to topic ServiceLifecycleCommandStatus".to_string())
         ));
 
-        ws.send(Message::Text("SUB s2 Msg mission".into()))
+        ws.send(Message::Text("SUB s2 ServiceStatus ServiceStatus".into()))
             .await
             .expect("send sub");
         assert!(matches!(recv_parsed(&mut ws).await, ServerOp::Ok));
@@ -1568,12 +1611,12 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         let mut ws = connect_with_owp(port).await;
         init_verbose(&mut ws, "svc1").await;
 
-        ws.send(Message::Text("SUB s1 Nope mission".into()))
+        ws.send(Message::Text("SUB s1 Nope ServiceStatus".into()))
             .await
             .expect("send sub");
         expect_err(&mut ws, OwpError::IllegalArgument).await;
 
-        ws.send(Message::Text("SUB s2 Msg mission".into()))
+        ws.send(Message::Text("SUB s2 ServiceStatus ServiceStatus".into()))
             .await
             .expect("send sub");
         assert!(matches!(recv_parsed(&mut ws).await, ServerOp::Ok));
@@ -1587,12 +1630,12 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         let mut ws = connect_with_owp(port).await;
         init_verbose(&mut ws, "svc1").await;
 
-        ws.send(Message::Text("SUB dup Msg mission".into()))
+        ws.send(Message::Text("SUB dup ServiceStatus ServiceStatus".into()))
             .await
             .expect("send sub");
         assert!(matches!(recv_parsed(&mut ws).await, ServerOp::Ok));
 
-        ws.send(Message::Text("SUB dup Msg mission".into()))
+        ws.send(Message::Text("SUB dup ServiceStatus ServiceStatus".into()))
             .await
             .expect("send duplicate sub");
         expect_err(&mut ws, OwpError::IllegalState).await;
@@ -1616,7 +1659,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             .expect("send unsub");
         expect_err(&mut ws, OwpError::IllegalState).await;
 
-        ws.send(Message::Text("SUB s1 Msg mission".into()))
+        ws.send(Message::Text("SUB s1 ServiceStatus ServiceStatus".into()))
             .await
             .expect("send sub");
         assert!(matches!(recv_parsed(&mut ws).await, ServerOp::Ok));
@@ -1634,7 +1677,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         init_verbose(&mut pub_ws, "svc2").await;
 
         sub_ws
-            .send(Message::Text("SUB s1 Msg mission".into()))
+            .send(Message::Text("SUB s1 ServiceStatus ServiceStatus".into()))
             .await
             .expect("send sub");
         assert!(matches!(recv_parsed(&mut sub_ws).await, ServerOp::Ok));
@@ -1646,7 +1689,9 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         assert!(matches!(recv_parsed(&mut sub_ws).await, ServerOp::Ok));
 
         pub_ws
-            .send(Message::Text("PUB mission {\"Msg\":{}}".into()))
+            .send(Message::Text(
+                "PUB ServiceStatus {\"ServiceStatus\":{}}".into(),
+            ))
             .await
             .expect("send pub");
         assert!(matches!(recv_parsed(&mut pub_ws).await, ServerOp::Ok));
@@ -1658,7 +1703,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         );
 
         sub_ws
-            .send(Message::Text("SUB s2 Msg mission".into()))
+            .send(Message::Text("SUB s2 ServiceStatus ServiceStatus".into()))
             .await
             .expect("send sub");
         assert!(matches!(recv_parsed(&mut sub_ws).await, ServerOp::Ok));
@@ -1677,7 +1722,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             .expect("send unknown op");
         expect_err(&mut ws, OwpError::IllegalOperation).await;
 
-        ws.send(Message::Text("SUB s1 Msg mission".into()))
+        ws.send(Message::Text("SUB s1 ServiceStatus ServiceStatus".into()))
             .await
             .expect("send sub");
         assert!(matches!(recv_parsed(&mut ws).await, ServerOp::Ok));
@@ -1705,7 +1750,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         init_verbose(&mut pub_ws, "svc2").await;
 
         sub_ws
-            .send(Message::Text("SUB s1 Msg mission".into()))
+            .send(Message::Text("SUB s1 ServiceStatus ServiceStatus".into()))
             .await
             .expect("send sub");
         assert!(
@@ -1715,7 +1760,9 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         );
 
         pub_ws
-            .send(Message::Text("PUB mission {\"Msg\":{}}".into()))
+            .send(Message::Text(
+                "PUB ServiceStatus {\"ServiceStatus\":{}}".into(),
+            ))
             .await
             .expect("send pub");
         assert!(matches!(recv_parsed(&mut pub_ws).await, ServerOp::Ok));
@@ -1724,7 +1771,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         assert!(matches!(
             delivered,
             ServerOp::Msg { ref sid, ref payload }
-            if sid == "s1" && &**payload == "{\"Msg\":{}}"
+            if sid == "s1" && &**payload == "{\"ServiceStatus\":{}}"
         ));
 
         shutdown_server(shutdown, handle).await;
@@ -1751,21 +1798,23 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         let _ = recv_text(&mut pub_ws).await;
 
         sub_ws
-            .send(Message::Text("SUB sub1 Msg mission".into()))
+            .send(Message::Text("SUB sub1 ServiceStatus ServiceStatus".into()))
             .await
             .expect("send sub");
         let sub_ok = recv_text(&mut sub_ws).await;
         assert_eq!(sub_ok, "+OK");
 
         pub_ws
-            .send(Message::Text("PUB mission {\"Msg\":{}}".into()))
+            .send(Message::Text(
+                "PUB ServiceStatus {\"ServiceStatus\":{}}".into(),
+            ))
             .await
             .expect("send pub");
         let pub_ok = recv_text(&mut pub_ws).await;
         assert_eq!(pub_ok, "+OK");
 
         let delivered = recv_text(&mut sub_ws).await;
-        assert_eq!(delivered, "MSG sub1 {\"Msg\":{}}");
+        assert_eq!(delivered, "MSG sub1 {\"ServiceStatus\":{}}");
 
         shutdown_server(shutdown, handle).await;
     }
@@ -1782,19 +1831,25 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         init_verbose(&mut pub_ws, "svc2").await;
 
         sub_ws1
-            .send(Message::Text("SUB shared Msg mission".into()))
+            .send(Message::Text(
+                "SUB shared ServiceStatus ServiceStatus".into(),
+            ))
             .await
             .expect("send first sub");
         assert!(matches!(recv_parsed(&mut sub_ws1).await, ServerOp::Ok));
 
         sub_ws2
-            .send(Message::Text("SUB shared Msg mission".into()))
+            .send(Message::Text(
+                "SUB shared ServiceStatus ServiceStatus".into(),
+            ))
             .await
             .expect("send second sub");
         assert!(matches!(recv_parsed(&mut sub_ws2).await, ServerOp::Ok));
 
         pub_ws
-            .send(Message::Text("PUB mission {\"Msg\":{}}".into()))
+            .send(Message::Text(
+                "PUB ServiceStatus {\"ServiceStatus\":{}}".into(),
+            ))
             .await
             .expect("send pub");
         assert!(matches!(recv_parsed(&mut pub_ws).await, ServerOp::Ok));
@@ -1812,7 +1867,9 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         assert!(matches!(recv_parsed(&mut sub_ws1).await, ServerOp::Ok));
 
         pub_ws
-            .send(Message::Text("PUB mission {\"Msg\":{}}".into()))
+            .send(Message::Text(
+                "PUB ServiceStatus {\"ServiceStatus\":{}}".into(),
+            ))
             .await
             .expect("send second pub");
         assert!(matches!(recv_parsed(&mut pub_ws).await, ServerOp::Ok));
@@ -1841,7 +1898,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             .expect("expected successful frame");
         assert!(matches!(first, Message::Ping(_)));
 
-        ws.send(Message::Text("SUB s1 Msg mission".into()))
+        ws.send(Message::Text("SUB s1 ServiceStatus ServiceStatus".into()))
             .await
             .expect("send follow-up SUB after ping");
         assert!(matches!(recv_parsed(&mut ws).await, ServerOp::Ok));
@@ -1855,21 +1912,23 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         let before = metric_value(
             &handle.render(),
             "sleet_messages_published_total",
-            Some("topic=\"mission\""),
+            Some("topic=\"ServiceStatus\""),
         );
 
         let (port, shutdown, task) = spawn_server().await;
         let mut ws = connect_with_owp(port).await;
         init_verbose(&mut ws, "svc1").await;
-        ws.send(Message::Text("PUB mission {\"Msg\":{}}".into()))
-            .await
-            .expect("send pub");
+        ws.send(Message::Text(
+            "PUB ServiceStatus {\"ServiceStatus\":{}}".into(),
+        ))
+        .await
+        .expect("send pub");
         assert!(matches!(recv_parsed(&mut ws).await, ServerOp::Ok));
 
         let after = metric_value(
             &handle.render(),
             "sleet_messages_published_total",
-            Some("topic=\"mission\""),
+            Some("topic=\"ServiceStatus\""),
         );
         assert!(after >= before + 1.0);
 
@@ -1888,7 +1947,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         let (port, shutdown, task) = spawn_server().await;
         let mut ws = connect_with_owp(port).await;
         init_verbose(&mut ws, "svc1").await;
-        ws.send(Message::Text("PUB mission {not json}".into()))
+        ws.send(Message::Text("PUB ServiceStatus {not json}".into()))
             .await
             .expect("send invalid pub");
         expect_err(&mut ws, OwpError::InvalidMessage).await;
@@ -1960,14 +2019,207 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
 
     // -- Topic binding enforcement --
 
+    #[tokio::test]
+    async fn fixed_policy_rejects_schema_valid_unsupported_roots_and_subscriptions() {
+        let (port, shutdown, handle) = spawn_server().await;
+        let mut ws = connect_with_owp(port).await;
+        init_verbose(&mut ws, "svc2").await; // No optional topic bindings.
+        ws.send(Message::text("PUB ServiceStatus {\"UnsupportedRoot\":{}}"))
+            .await
+            .unwrap();
+        let ServerOp::Err {
+            error,
+            details: Some(details),
+        } = recv_parsed(&mut ws).await
+        else {
+            panic!("unsupported root must be rejected with details");
+        };
+        assert_eq!(error, OwpError::InvalidMessage);
+        assert!(details.contains("UnsupportedRoot") && details.contains("ServiceStatus"));
+        ws.send(Message::text("SUB rejected UnsupportedRoot ServiceStatus"))
+            .await
+            .unwrap();
+        expect_err(&mut ws, OwpError::IllegalArgument).await;
+        ws.send(Message::text(
+            "SUB rejected ServiceLifecycleCommand ServiceStatus",
+        ))
+        .await
+        .unwrap();
+        expect_err(&mut ws, OwpError::IllegalState).await;
+        // Neither rejection consumed the SID; the connection is still usable.
+        ws.send(Message::text("SUB rejected ServiceStatus ServiceStatus"))
+            .await
+            .unwrap();
+        assert!(matches!(recv_parsed(&mut ws).await, ServerOp::Ok));
+        for topic in ["ServiceStatus.svc2", "ServiceStatus-svc2", "unsupported"] {
+            ws.send(Message::text(format!(
+                "PUB {topic} {{\"ServiceStatus\":{{}}}}"
+            )))
+            .await
+            .unwrap();
+            expect_err(&mut ws, OwpError::IllegalState).await;
+            ws.send(Message::text(format!("SUB alias ServiceStatus {topic}")))
+                .await
+                .unwrap();
+            expect_err(&mut ws, OwpError::IllegalState).await;
+        }
+        ws.send(Message::text("SUB wildcard ServiceStatus *"))
+            .await
+            .unwrap();
+        expect_err(&mut ws, OwpError::IllegalArgument).await;
+        shutdown_server(shutdown, handle).await;
+    }
+
+    #[tokio::test]
+    async fn topic_rejection_is_visible_in_non_verbose_mode() {
+        let (port, shutdown, handle) = spawn_server().await;
+        let mut ws = connect_with_owp(port).await;
+        ws.send(Message::Text(init_frame_custom(
+            "svc2",
+            &["1.0"],
+            "002.5.0",
+            Some(false),
+        )))
+        .await
+        .unwrap();
+        assert!(matches!(recv_parsed(&mut ws).await, ServerOp::Info(_)));
+        ws.send(Message::text(
+            "PUB ServiceStatus {\"ServiceLifecycleCommand\":{\"Id\":\"x\"}}",
+        ))
+        .await
+        .unwrap();
+        expect_err(&mut ws, OwpError::InvalidMessage).await;
+        ws.send(Message::text(
+            "SUB rejected ServiceStatus ServiceLifecycleCommand",
+        ))
+        .await
+        .unwrap();
+        expect_err(&mut ws, OwpError::IllegalState).await;
+        shutdown_server(shutdown, handle).await;
+    }
+
+    #[tokio::test]
+    async fn repeated_self_subscriptions_fan_out_and_unsubscribe_independently() {
+        let (port, shutdown, handle) = spawn_server().await;
+        let mut ws = connect_with_owp(port).await;
+        init_verbose(&mut ws, "svc1").await;
+        for sid in ["first", "second"] {
+            ws.send(Message::text(format!(
+                "SUB {sid} ServiceStatus ServiceStatus"
+            )))
+            .await
+            .unwrap();
+            assert!(matches!(recv_parsed(&mut ws).await, ServerOp::Ok));
+        }
+        ws.send(Message::text("PUB ServiceStatus {\"ServiceStatus\":{}}"))
+            .await
+            .unwrap();
+        let mut ids = std::collections::HashSet::new();
+        let mut acknowledgments = 0;
+        for _ in 0..3 {
+            match recv_parsed(&mut ws).await {
+                ServerOp::Ok => acknowledgments += 1,
+                ServerOp::Msg { sid, payload } => {
+                    assert_eq!(&*payload, "{\"ServiceStatus\":{}}");
+                    assert!(ids.insert(sid), "each registration receives once");
+                }
+                other => panic!("expected acknowledgment or delivery, got {other:?}"),
+            }
+        }
+        assert_eq!(acknowledgments, 1);
+        assert_eq!(ids, ["first".to_owned(), "second".to_owned()].into());
+        ws.send(Message::text("UNSUB first")).await.unwrap();
+        assert!(matches!(recv_parsed(&mut ws).await, ServerOp::Ok));
+        ws.send(Message::text("PUB ServiceStatus {\"ServiceStatus\":{}}"))
+            .await
+            .unwrap();
+        expect_publication_delivery(&mut ws, "second", "{\"ServiceStatus\":{}}").await;
+        shutdown_server(shutdown, handle).await;
+    }
+
+    #[tokio::test]
+    async fn groups_and_ordinary_fanout_are_isolated_by_topic() {
+        let (port, shutdown, handle) = spawn_server().await;
+        let mut publisher = connect_with_owp(port).await;
+        let mut subscriber = connect_with_owp(port).await;
+        let mut statuses = connect_with_owp(port).await;
+        init_verbose(&mut publisher, "svc1").await;
+        init_verbose(&mut subscriber, "svc2").await;
+        init_verbose(&mut statuses, "svc3").await;
+        for frame in [
+            "SUB ordinary ServiceStatus ServiceStatus",
+            "SUB worker1 ServiceStatus ServiceStatus workers",
+            "SUB worker2 ServiceStatus ServiceStatus workers",
+            "SUB independent ServiceStatus ServiceStatus other-workers",
+            "SUB command ServiceLifecycleCommand ServiceLifecycleCommand workers",
+        ] {
+            subscriber.send(Message::text(frame)).await.unwrap();
+            assert!(matches!(recv_parsed(&mut subscriber).await, ServerOp::Ok));
+        }
+        statuses
+            .send(Message::text(
+                "SUB result ServiceLifecycleCommandStatus ServiceLifecycleCommandStatus workers",
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(recv_parsed(&mut statuses).await, ServerOp::Ok));
+        publisher
+            .send(Message::text("PUB ServiceStatus {\"ServiceStatus\":{}}"))
+            .await
+            .unwrap();
+        assert!(matches!(recv_parsed(&mut publisher).await, ServerOp::Ok));
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..3 {
+            let ServerOp::Msg { sid, payload } = recv_parsed(&mut subscriber).await else {
+                panic!("expected group or ordinary delivery");
+            };
+            assert_eq!(&*payload, "{\"ServiceStatus\":{}}");
+            assert!(ids.insert(sid));
+        }
+        assert!(ids.contains("ordinary") && ids.contains("independent"));
+        assert_eq!(
+            usize::from(ids.contains("worker1")) + usize::from(ids.contains("worker2")),
+            1
+        );
+        // Publishing another type makes leaked or duplicate status fail the next read.
+        publisher
+            .send(Message::text(
+                "PUB ServiceLifecycleCommand {\"ServiceLifecycleCommand\":{\"Id\":\"x\"}}",
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(recv_parsed(&mut publisher).await, ServerOp::Ok));
+        assert!(
+            matches!(recv_parsed(&mut subscriber).await, ServerOp::Msg { sid, .. } if sid == "command")
+        );
+        statuses
+            .send(Message::text(
+                "PUB ServiceLifecycleCommandStatus {\"ServiceLifecycleCommandStatus\":{}}",
+            ))
+            .await
+            .unwrap();
+        expect_publication_delivery(
+            &mut statuses,
+            "result",
+            "{\"ServiceLifecycleCommandStatus\":{}}",
+        )
+        .await;
+        assert!(
+            timeout(Duration::from_millis(100), subscriber.next())
+                .await
+                .is_err()
+        );
+        shutdown_server(shutdown, handle).await;
+    }
+
     /// Helper to spawn a server where svc1 has topic bindings restricting
-    /// "mission" to only accept "Msg" messages.
+    /// `ServiceStatus` to only accept `ServiceStatus` messages.
     async fn spawn_server_with_topic_bindings() -> (u16, CancellationToken, JoinHandle<()>) {
         spawn_server_custom(
             None,
             &[(
                 "svc1.toml",
-                "\n[[topic_bindings]]\ntopic = \"mission\"\nallowed_messages = [\"Msg\"]\n",
+                "\n[[topic_bindings]]\ntopic = \"ServiceStatus\"\nallowed_messages = [\"ServiceStatus\"]\n",
             )],
         )
         .await
@@ -1979,50 +2231,54 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         let mut ws = connect_with_owp(port).await;
         init_verbose(&mut ws, "svc1").await;
 
-        ws.send(Message::Text("PUB mission {\"Msg\":{}}".into()))
-            .await
-            .expect("send pub");
+        ws.send(Message::Text(
+            "PUB ServiceStatus {\"ServiceStatus\":{}}".into(),
+        ))
+        .await
+        .expect("send pub");
         assert!(matches!(recv_parsed(&mut ws).await, ServerOp::Ok));
 
         shutdown_server(shutdown, handle).await;
     }
 
     #[tokio::test]
-    async fn pub_disallowed_message_type_for_topic_returns_illegal_state() {
+    async fn pub_disallowed_message_type_for_topic_returns_invalid_message() {
         let (port, shutdown, handle) = spawn_server_with_topic_bindings().await;
         let mut ws = connect_with_owp(port).await;
         init_verbose(&mut ws, "svc1").await;
 
-        // DetailedMsg is a valid schema element but not in svc1's topic_bindings for "mission"
+        // Schema-valid root, but it does not match the selected topic.
         ws.send(Message::Text(
-            "PUB mission {\"DetailedMsg\":{\"Id\":\"x\"}}".into(),
+            "PUB ServiceStatus {\"ServiceLifecycleCommand\":{\"Id\":\"x\"}}".into(),
         ))
         .await
         .expect("send pub");
-        expect_err(&mut ws, OwpError::IllegalState).await;
+        expect_err(&mut ws, OwpError::InvalidMessage).await;
 
         // Connection stays open after topic-binding rejection
-        ws.send(Message::Text("PUB mission {\"Msg\":{}}".into()))
-            .await
-            .expect("send follow-up pub");
+        ws.send(Message::Text(
+            "PUB ServiceStatus {\"ServiceStatus\":{}}".into(),
+        ))
+        .await
+        .expect("send follow-up pub");
         assert!(matches!(recv_parsed(&mut ws).await, ServerOp::Ok));
 
         shutdown_server(shutdown, handle).await;
     }
 
     #[tokio::test]
-    async fn pub_unbound_topic_allows_any_message() {
+    async fn pub_without_optional_binding_rejects_mismatched_root() {
         let (port, shutdown, handle) = spawn_server_with_topic_bindings().await;
         let mut ws = connect_with_owp(port).await;
-        // svc2 has no topic_bindings - permissive
+        // svc2 has no optional topic_bindings; the fixed policy still applies.
         init_verbose(&mut ws, "svc2").await;
 
         ws.send(Message::Text(
-            "PUB mission {\"DetailedMsg\":{\"Id\":\"x\"}}".into(),
+            "PUB ServiceStatus {\"ServiceLifecycleCommand\":{\"Id\":\"x\"}}".into(),
         ))
         .await
         .expect("send pub");
-        assert!(matches!(recv_parsed(&mut ws).await, ServerOp::Ok));
+        expect_err(&mut ws, OwpError::InvalidMessage).await;
 
         shutdown_server(shutdown, handle).await;
     }
@@ -2033,16 +2289,18 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         let mut ws = connect_with_owp(port).await;
         init_verbose(&mut ws, "svc1").await;
 
-        // Invalid JSON - schema validation fires before topic-binding check
-        ws.send(Message::Text("PUB mission {not json}".into()))
+        // Invalid JSON is rejected before topic/root assessment.
+        ws.send(Message::Text("PUB ServiceStatus {not json}".into()))
             .await
             .expect("send pub");
         expect_err(&mut ws, OwpError::InvalidMessage).await;
 
         // Connection stays open
-        ws.send(Message::Text("PUB mission {\"Msg\":{}}".into()))
-            .await
-            .expect("send follow-up pub");
+        ws.send(Message::Text(
+            "PUB ServiceStatus {\"ServiceStatus\":{}}".into(),
+        ))
+        .await
+        .expect("send follow-up pub");
         assert!(matches!(recv_parsed(&mut ws).await, ServerOp::Ok));
 
         shutdown_server(shutdown, handle).await;
@@ -2057,12 +2315,12 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         let mut publisher = connect_client_with_retry(&url, "svc2").await;
 
         subscriber
-            .subscribe("s-client", "Msg", "mission", None)
+            .subscribe("s-client", "ServiceStatus", "ServiceStatus", None)
             .await
             .expect("subscribe should succeed");
 
         publisher
-            .publish("mission", &serde_json::json!({"Msg": {}}))
+            .publish("ServiceStatus", &serde_json::json!({"ServiceStatus": {}}))
             .await
             .expect("publish should succeed");
 
@@ -2071,7 +2329,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             .await
             .expect("message should be delivered");
         assert_eq!(received.sid, "s-client");
-        assert_eq!(&*received.payload, "{\"Msg\":{}}");
+        assert_eq!(&*received.payload, "{\"ServiceStatus\":{}}");
 
         shutdown_server(shutdown, handle).await;
     }

@@ -1,9 +1,13 @@
 # Native Rust LA-CAL prototype
 
-The project-owned SLEET adoption baseline (ticket 14) runs on native macOS:
+The project-owned SLEET-derived server (tickets 14–15) runs on native macOS:
 an authorized OWP Client negotiates `owp` / OWP 1.0, subscribes, publishes a
 validated UCI 002.5.0 `ServiceStatus`, observes `+OK` and receives the original
 JSON in `MSG` through the adopted local router.
+
+The supported topics are `ServiceLifecycleCommand`,
+`ServiceLifecycleCommandStatus` and `ServiceStatus`, each accepting only its
+identically named UCI 002.5.0 root. Target Services are identified in payloads.
 
 ## Build and run
 
@@ -18,7 +22,9 @@ target/debug/la-cal config/server.toml
 The server binds `127.0.0.1:9000`. Stop it with Ctrl-C. The configuration's
 schema and participant-directory paths are relative to the working directory.
 `config/services.d/baseline.toml` authorizes `baseline-tester` for the
-`baseline` topic, bound to `ServiceStatus`. No credentials or TLS are configured.
+three supported topics. Optional explicit `topic_bindings` must match the fixed
+topic/root policy; omitting them does not permit other roots. Unsupported topics
+or schema profiles fail configuration loading. No credentials or TLS are configured.
 
 For a repeatable native exchange with automatic server launch and cleanup:
 
@@ -27,9 +33,10 @@ cargo test --locked -p la-cal --test native_baseline -- --nocapture
 ```
 
 This test launches the actual `la-cal` binary on an ephemeral loopback port,
-checks the negotiated WebSocket subprotocol and INFO identities, awaits SUB,
-PUB and UNSUB acknowledgments, and independently checks original-byte MSG
-delivery. Readiness and the exchange are bounded; the owned process is killed
+checks the negotiated WebSocket subprotocol and INFO identities, subscribes to
+all three roots, rejects cross-topic publications without closing the connection,
+awaits SUB, PUB and UNSUB acknowledgments, and independently checks original-byte
+`ServiceStatus` MSG delivery. Readiness and the exchange are bounded; the owned process is killed
 and reaped on success or test failure. It uses
 [`fixtures/service-status.json`](fixtures/service-status.json), constructed
 from the pinned schema rather than a generated serialization expectation.
@@ -54,12 +61,12 @@ Explicit regeneration and separate UCI terms are documented in
 
 | Package | Purpose at this milestone |
 | --- | --- |
-| `la-cal` | Adopted OWP frontend, authorization, local routing/groups, direct Rust schema validator, admin/telemetry and copied tests |
+| `la-cal` | Adopted OWP frontend, fixed three-root topic policy, authorization, local routing/groups, direct Rust schema validator, admin/telemetry and copied tests |
 | `owp-types` | Adopted OWP grammar/types and baseline UCI bindings/tests |
 | `baseline-client` | Unmodified upstream-style client used by copied socket tests; temporary adoption support |
 
-The final cloneable typed `la-cal-client`, message-type topic policy, real
-Zenoh/Protobuf ASB and relayed STOP applications are subsequent tickets. This
+The final cloneable typed `la-cal-client`, real Zenoh/Protobuf ASB and relayed
+STOP applications are subsequent tickets. This
 baseline intentionally retains upstream publication/delivery and queue behavior.
 It is source-adoption evidence, not final prototype acceptance or a conformance
 claim. Plain `ws` retains the explicit RFC 6455 §10.6 TLS-capability exception.
@@ -68,3 +75,6 @@ See [`docs/baseline-evidence.md`](docs/baseline-evidence.md) for executed checks
 versions and known limitations. [`NOTICE`](NOTICE) records the selected SLEET
 revision and actual modifications; [`LICENSE`](LICENSE) preserves its Apache-2.0
 terms. Reference submodules are read-only.
+
+Ticket 15's topic-policy checks and coverage limits are recorded in
+[`docs/topic-routing-evidence.md`](docs/topic-routing-evidence.md).
