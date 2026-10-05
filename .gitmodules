@@ -7,3 +7,6 @@
 [submodule "standard-and-references/oms-standard"]
 	path = standards-and-references/oms-standard
 	url = https://gitlab.com/open-arsenal/oms/standard.git
+[submodule "standards-and-references/la-cal-harness"]
+	path = standards-and-references/la-cal-harness
+	url = https://gitlab.com/open-arsenal/ams-gra/hello-world-sk/test/la-cal-harness.git
