@@ -309,6 +309,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "commandee-service"
+version = "0.1.0"
+dependencies = [
+ "demo-driver",
+ "futures-util",
+ "la-cal-client",
+ "tokio",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -512,6 +522,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
 dependencies = [
  "thiserror",
+]
+
+[[package]]
+name = "demo-driver"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "la-cal-client",
+ "owp-types",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
+ "toml",
+ "uuid",
 ]
 
 [[package]]
@@ -1837,6 +1862,16 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "orchestrator"
+version = "0.1.0"
+dependencies = [
+ "demo-driver",
+ "futures-util",
+ "la-cal-client",
+ "tokio",
+]
 
 [[package]]
 name = "owp-types"

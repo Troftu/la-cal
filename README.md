@@ -1,6 +1,6 @@
 # Native Rust LA-CAL prototype
 
-The project-owned SLEET-derived server and typed Rust client (tickets 14–19) run on native macOS:
+The project-owned server, typed Rust client and readiness applications (tickets 14–20) run on native macOS:
 an authorized OWP Client negotiates `owp` / OWP 1.0, subscribes, publishes a
 validated UCI 002.5.0 `ServiceStatus`, observes `+OK` and receives the original
 JSON in `MSG` through the real Zenoh/Protobuf ASB subscriber. Only ASB ingress
@@ -79,6 +79,54 @@ Readiness and exchanges are bounded; owned processes are killed and
 reaped on success or failure. The test uses
 [`fixtures/service-status.json`](fixtures/service-status.json), constructed
 from the pinned schema rather than a generated serialization expectation.
+
+## Service readiness demo
+
+From the repository root, one driver owns native router/server and both Services:
+
+```sh
+cargo build --locked --workspace
+target/debug/demo-driver --readiness
+# Repeatable deployed readiness and cleanup checks:
+cargo test --locked -p demo-driver --test readiness
+```
+
+Put `zenohd` on PATH or set `ZENOHD` to its absolute path. The driver selects
+isolated loopback ports and generates temporary router/server authorization from
+the resolved identities. It installs independent typed status/result observations
+**before** launching either application, then requires INITIALIZING, NORMAL and
+a later periodic NORMAL report from each distinct Service. Every launch, report
+wait and cleanup is bounded; failures print child diagnostics. Cleanup requests
+SIGTERM, escalates to SIGKILL if necessary and waits for every owned child.
+Ctrl-C also takes the cleanup path. Launch only from the repository root so the
+pinned schema is found. Applications live beside the driver binary.
+
+Each Service owns its client, required subscriptions and reporting loop directly.
+Configuration/payload helpers are shared, not a lifecycle runtime. The readiness
+driver sends no commands: STOP execution, relay and final verdict follow in
+tickets 21–23. Unexpected commands fail visibly rather than fabricate a result.
+
+| Environment override | Default / range |
+| --- | --- |
+| `DEMO_DRIVER_PARTICIPANT`, `DEMO_ORCHESTRATOR_PARTICIPANT`, `DEMO_COMMANDEE_PARTICIPANT` | `demo-driver`, `orchestrator`, `commandee-service` |
+| `DEMO_DRIVER_UUID`, `DEMO_ORCHESTRATOR_UUID`, `DEMO_COMMANDEE_UUID` | `123e4567-e89b-12d3-a456-426614174010`, `…4011`, `…4012` (full defaults in `DemoConfig`) |
+| `DEMO_SYSTEM_UUID` | `123e4567-e89b-12d3-a456-426614174000` |
+| `DEMO_MISSION_UUID` | `123e4567-e89b-12d3-a456-426614174020` |
+| `DEMO_STATUS_SECONDS` | `1`; whole seconds 1–600 |
+| `DEMO_WAIT_MS` | `5000`; 1–3600000 per required wait (server ASB waits cap at 60000) |
+| `DEMO_ENDPOINT` | Standalone Services: `ws://127.0.0.1:9000/`; driver supplies its isolated loopback endpoint |
+| `DEMO_LA_CAL_BIN`, `DEMO_ORCHESTRATOR_BIN`, `DEMO_COMMANDEE_SERVICE_BIN` | Sibling application binaries; optional executable path overrides |
+
+Participant names and Service UUIDs must each be distinct. Invalid names, UUIDs,
+endpoints and numeric settings fail before driver launch. Increase the event wait
+above the reporting period when using longer periods, for example:
+
+```sh
+DEMO_STATUS_SECONDS=2 DEMO_WAIT_MS=6000 target/debug/demo-driver --readiness
+```
+
+See [`docs/service-readiness-evidence.md`](docs/service-readiness-evidence.md)
+for the native run, configuration, source grounding and coverage limits.
 
 ## Checks and regeneration
 
@@ -197,11 +245,14 @@ been run against the project server, and the acceptance scope is unchanged.
 | `owp-types` | Adopted OWP grammar/types and baseline UCI bindings/tests |
 | `baseline-client` | Unmodified upstream-style client used by copied socket tests; temporary adoption support |
 | `la-cal-client` | Cloneable async typed client, independent subscription streams and checked-in UCI 002.5.0 roots/dependencies |
+| `demo-driver` | Native process ownership, independent typed readiness observation, bounded cleanup and shared configuration/payload helpers |
+| `orchestrator` | Application-owned initialization, persistent command/result/status streams and reporting |
+| `commandee-service` | Application-owned initialization, persistent command stream and reporting |
 
 Tickets 18–19 complete client cancellation/deadline/drain verification, detected
 router-loss failure and the 64-message server queue/close-on-overflow contract.
-Service readiness/process ownership is next in ticket 20; the relayed STOP
-applications remain subsequent tickets.
+Ticket 20 supplies readiness/process ownership; STOP execution and relay remain
+subsequent tickets.
 It is source-adoption evidence, not final prototype acceptance or a conformance
 claim. Plain `ws` retains the explicit RFC 6455 §10.6 TLS-capability exception.
 

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/la-cal", "crates/owp-types", "crates/baseline-client", "crates/la-cal-client"]
+members = ["crates/la-cal", "crates/owp-types", "crates/baseline-client", "crates/la-cal-client", "crates/demo-driver", "crates/orchestrator", "crates/commandee-service"]
 resolver = "3"
 
 [workspace.lints.rust]

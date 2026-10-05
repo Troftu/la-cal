@@ -1,0 +1,19 @@
+[package]
+name = "orchestrator"
+version = "0.1.0"
+edition = "2024"
+description = "Application-owned OMS orchestrator demonstration Service"
+license = "Apache-2.0"
+repository = "https://github.com/Troftu/la-cal"
+keywords = ["oms", "uci", "cal", "demo"]
+categories = ["network-programming"]
+readme = "../../README.md"
+
+[dependencies]
+demo-driver = { path = "../demo-driver" }
+futures-util = "0.3"
+la-cal-client = { path = "../la-cal-client" }
+tokio = { version = "1.53.2", features = ["full"] }
+
+[lints]
+workspace = true
