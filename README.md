@@ -117,9 +117,20 @@ INFO has no schema member in Rev B: successful INIT accepts the requested
 
 Clones share one connection. Concurrent calls queue PUB/SUB/UNSUB with one
 transmitted pending acknowledgment, while MSG and WebSocket controls remain live.
+The private reader and writer make independent progress even under socket-write
+backpressure; receiving Ping does not block subsequent MSG dispatch on Pong flushing.
 Send success means OWP publication completion; server errors retain their exact
 code/details. Connection failures distinguish protocol, transport and deadlines,
 and record whether transmission was attempted (a sent publication can be uncertain).
+
+Canceling a sent operation's wait leaves background I/O responsible for its response
+or operation deadline. Cancellation does not close the connection, undo publication
+or retry it; reception continues. A missing acknowledgment terminally fails the
+shared connection: queued operations are never sent and late responses cannot be
+assigned to them. Pending operations report `transmitted: true` (uncertain PUB
+outcome), whereas queued operations and later clone calls report the same cause
+with `transmitted: false`. Attributable `-ERR` rejections retain server details and
+leave a valid connection usable; malformed controls are terminal protocol failures.
 
 Every subscribe owns its own OWP registration and persistent
 `Stream<Item = Result<T, ReceiveError>>`, including repeated subscriptions to the
@@ -132,13 +143,22 @@ configurable overflow contract is established.
 Subscription `close(self).await` consumes its stream and awaits only its UNSUB.
 Drop stops local reception and requests best-effort cleanup. Ordinary client-clone
 drop leaves other owners usable; explicit `close().await` through any clone closes
-the shared connection. The implementation retains transmitted-operation ownership
-and bounded drain hooks for ticket 18's detailed cancellation/deadline/closure work.
+the shared connection. Close atomically stops new admissions, drains admitted
+operations within `close_timeout`, then gives WebSocket closure its own
+`close_timeout` (five seconds by default for each wait). Drain expiry still attempts
+bounded cleanup; socket backpressure cannot postpone that drain deadline. Close
+returns a drain rejection or terminal drain/closure failure, and concurrent or later
+close waiters see the same result. Canceling a close waiter does not cancel shutdown.
+Live streams receive terminal connection errors, including closure failure, before
+ending. Await final publications before close; last-owner/subscription Drop remains
+best effort rather than acknowledged teardown.
 
 The native process test also exchanges all three typed roots and a polymorphic
 diagnostic fixture, independently observes the corresponding Zenoh envelopes,
 and verifies repeated registrations and explicit cleanup. See
 [`docs/typed-client-evidence.md`](docs/typed-client-evidence.md) for executed checks.
+Ticket 18's cancellation/failure/closure results and independent review are in
+[`docs/client-closure-evidence.md`](docs/client-closure-evidence.md).
 
 ## Workspace and milestone
 
@@ -149,8 +169,8 @@ and verifies repeated registrations and explicit cleanup. See
 | `baseline-client` | Unmodified upstream-style client used by copied socket tests; temporary adoption support |
 | `la-cal-client` | Cloneable async typed client, independent subscription streams and checked-in UCI 002.5.0 roots/dependencies |
 
-Ticket 18 completes detailed client cancellation/deadline/drain verification;
-the relayed STOP applications remain subsequent tickets. Ticket 19 completes detected-router-loss failure and bounded
+Ticket 18 completes client cancellation/deadline/drain verification; the relayed
+STOP applications remain subsequent tickets. Ticket 19 completes detected-router-loss failure and bounded
 server queue behavior; the inherited 1024-message/drop-on-overflow queue remains.
 It is source-adoption evidence, not final prototype acceptance or a conformance
 claim. Plain `ws` retains the explicit RFC 6455 §10.6 TLS-capability exception.

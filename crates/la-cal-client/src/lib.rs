@@ -72,7 +72,8 @@ pub struct ClientConfig {
     pub connection_timeout: Duration,
     /// Deadline for each transmitted acknowledgment-tracked operation.
     pub operation_timeout: Duration,
-    /// Deadline for draining and closing the shared connection.
+    /// Deadline per cleanup wait: drain admitted operations, then WebSocket closure.
+    /// Each wait gets its own bound, including cleanup after drain failure.
     pub close_timeout: Duration,
 }
 
@@ -114,7 +115,8 @@ pub enum ClientError {
         /// Whether transmission was attempted. A publication's outcome is uncertain when true.
         transmitted: bool,
     },
-    /// Shared connection is closed or closing; this operation was not transmitted.
+    /// Shared connection is gracefully closed or closing; this operation was not transmitted.
+    /// Failed connections instead retain their terminal connection cause.
     Closed,
 }
 
@@ -160,7 +162,7 @@ pub enum ReceiveError {
         /// Typed decoding details.
         details: String,
     },
-    /// Unexpected transport/protocol failure, followed by stream end.
+    /// Terminal transport/protocol/deadline failure, followed by stream end.
     Connection {
         /// Machine-readable failure category.
         kind: ConnectionFailure,
@@ -180,12 +182,18 @@ impl std::error::Error for ReceiveError {}
 
 struct Shared {
     // The admission lock gives close one boundary across all clones.
-    admissions: Mutex<bool>,
+    admissions: Arc<Mutex<Admissions>>,
     commands: mpsc::UnboundedSender<Command>,
     shutdown: watch::Sender<Option<Instant>>,
     finished: watch::Receiver<Option<Result<(), ClientError>>>,
     next_sid: AtomicU64,
     close_timeout: Duration,
+}
+
+pub(crate) enum Admissions {
+    Open,
+    Closing,
+    Failed(ClientError),
 }
 
 /// Cloneable typed client. Clones share one OWP connection and operation attribution queue.
@@ -201,16 +209,19 @@ impl Client {
         let (commands, receiver) = mpsc::unbounded_channel();
         let (shutdown, shutdown_receiver) = watch::channel(None);
         let (finished_sender, finished) = watch::channel(None);
+        let admissions = Arc::new(Mutex::new(Admissions::Open));
         tokio::spawn(connection::run(
             socket,
             receiver,
             shutdown_receiver,
             finished_sender,
             config.operation_timeout,
+            config.close_timeout,
+            admissions.clone(),
         ));
         Ok(Self {
             shared: Arc::new(Shared {
-                admissions: Mutex::new(true),
+                admissions,
                 commands,
                 shutdown,
                 finished,
@@ -221,6 +232,11 @@ impl Client {
     }
 
     /// Complete on successful OWP Publication Acknowledgment, not application receipt or completion.
+    ///
+    /// Canceling the caller's wait after transmission does not cancel or retry the
+    /// publication. Background I/O consumes its response before sending the next
+    /// tracked operation. A missing acknowledgment fails the shared connection;
+    /// `Connection { transmitted: true, .. }` leaves publication outcome uncertain.
     pub async fn send<T: Message>(&self, message: &T) -> Result<(), ClientError> {
         let json =
             serde_json::to_string(message).map_err(|e| ClientError::Encoding(e.to_string()))?;
@@ -261,11 +277,17 @@ impl Client {
     }
 
     /// Stop admissions from every clone, drain admitted operations and close the shared connection.
+    ///
+    /// Drain and WebSocket closure each use `close_timeout`. A drain failure still
+    /// progresses bounded cleanup. A rejection encountered during drain is returned
+    /// after finishing admitted operations; terminal failure takes precedence.
+    /// Canceling this waiter leaves shutdown running. All close waiters observe the
+    /// same completion result; await final publications before starting close.
     pub async fn close(&self) -> Result<(), ClientError> {
         {
             let mut admitted = self.shared.admissions.lock().expect("admission lock");
-            if *admitted {
-                *admitted = false;
+            if matches!(*admitted, Admissions::Open) {
+                *admitted = Admissions::Closing;
                 drop(admitted);
                 self.shared
                     .shutdown
@@ -284,8 +306,10 @@ impl Client {
 
     fn enqueue(&self, command: Command) -> Result<(), ClientError> {
         let admitted = self.shared.admissions.lock().expect("admission lock");
-        if !*admitted {
-            return Err(ClientError::Closed);
+        match &*admitted {
+            Admissions::Open => (),
+            Admissions::Closing => return Err(ClientError::Closed),
+            Admissions::Failed(error) => return Err(error.clone()),
         }
         let result = self
             .shared
