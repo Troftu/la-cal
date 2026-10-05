@@ -1,4 +1,4 @@
-//! Process-owning native readiness demonstration.
+//! Process-owning native readiness and direct STOP demonstration.
 
 mod processes;
 
@@ -13,30 +13,41 @@ use demo_driver::{DemoConfig, Identity, shutdown_signal};
 use futures_util::StreamExt;
 use la_cal_client::{
     Client, Subscription,
-    messages::uci_002_5::{ServiceLifecycleCommandStatus, ServiceStateEnum, ServiceStatus},
+    messages::uci_002_5::{
+        CommandProcessingStateEnum, ServiceLifecycleCommandStatus,
+        ServiceLifecycleCommandStatusEnum, ServiceStateEnum, ServiceStatus,
+    },
 };
 use tokio::{
     process::Command,
     time::{Instant, sleep, timeout},
 };
 
-use processes::Processes;
+use processes::{ProcessExit, Processes};
 
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("FAIL readiness: {error}");
+            eprintln!("FAIL readiness/direct STOP: {error}");
             ExitCode::FAILURE
         }
     }
 }
 
 async fn run() -> Result<(), String> {
-    if std::env::args().skip(1).collect::<Vec<_>>() != ["--readiness"] {
-        return Err("usage: demo-driver --readiness (STOP demo follows in tickets 21–23)".into());
-    }
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let direct = match args.as_slice() {
+        [arg] if arg == "--readiness" => false,
+        [arg] if arg == "--direct-stop" => true,
+        _ => {
+            return Err(
+                "usage: demo-driver --readiness | --direct-stop (relay follows in ticket 22)"
+                    .into(),
+            );
+        }
+    };
     let mut config = DemoConfig::from_env()?;
     let root = std::env::current_dir().map_err(|e| e.to_string())?;
     let binaries = std::env::current_exe()
@@ -59,8 +70,18 @@ async fn run() -> Result<(), String> {
     let (mut processes, mut exits) = Processes::new(config.wait);
     let mut connection = None;
     let outcome = tokio::select! {
-        result = readiness(&config, &binaries, directory.path(), router_addr, server_addr, &mut processes, &mut connection) => result,
-        exit = exits.recv() => Err(exit.unwrap_or_else(|| "process observation ended".into())),
+        result = async {
+            let (mut statuses, mut results) = tokio::select! {
+                result = readiness(&config, &binaries, directory.path(), router_addr, server_addr, &mut processes, &mut connection) => result?,
+                exit = exits.recv() => return Err(exit.map_or_else(|| "process observation ended".into(), |exit| exit.unexpected())),
+            };
+            if direct {
+                let client = connection.as_ref().ok_or("missing driver client")?;
+                direct_stop(&config, client, &mut statuses, &mut results, &mut exits).await
+            } else {
+                Ok(())
+            }
+        } => result,
         signal = shutdown_signal() => Err(signal.err().unwrap_or_else(|| "driver interrupted".into())),
     };
     // Always close the independent observer and reap every successfully launched
@@ -74,14 +95,22 @@ async fn run() -> Result<(), String> {
         Ok(())
     };
     // Recheck an exit already queued at the readiness/cleanup boundary.
-    let outcome = outcome
-        .and(close)
-        .and_then(|()| exits.try_recv().map_or(Ok(()), Err));
+    let outcome = outcome.and(close).and_then(|()| {
+        exits
+            .try_recv()
+            .map_or(Ok(()), |exit| Err(exit.unexpected()))
+    });
     let cleanup = processes.cleanup(outcome.is_err()).await;
     outcome.and(cleanup)?;
-    println!(
-        "PASS readiness: both distinct Services NORMAL and periodically reporting; all owned processes reaped"
-    );
+    if direct {
+        println!(
+            "PASS direct STOP: terminal result, INOPERABLE and process exit independently observed; Orchestrator remains NORMAL; all owned processes reaped"
+        );
+    } else {
+        println!(
+            "PASS readiness: both distinct Services NORMAL and periodically reporting; all owned processes reaped"
+        );
+    }
     Ok(())
 }
 
@@ -93,7 +122,13 @@ async fn readiness(
     server_addr: SocketAddr,
     processes: &mut Processes,
     connection: &mut Option<Client>,
-) -> Result<(), String> {
+) -> Result<
+    (
+        Subscription<ServiceStatus>,
+        Subscription<ServiceLifecycleCommandStatus>,
+    ),
+    String,
+> {
     let mut router = Command::new(std::env::var_os("ZENOHD").unwrap_or_else(|| "zenohd".into()));
     router
         .arg("-c")
@@ -129,12 +164,140 @@ async fn readiness(
         Progress::new("orchestrator", &config.orchestrator, config.wait),
         Progress::new("commandee-service", &config.commandee, config.wait),
     ];
-    observe_readiness(config, &mut statuses, &mut results, &mut services).await
+    observe_readiness(config, &mut statuses, &mut results, &mut services).await?;
+    Ok((statuses, results))
 }
 
 fn application_command(name: &str, binaries: &Path) -> Command {
     let variable = format!("DEMO_{}_BIN", name.replace('-', "_").to_uppercase());
     Command::new(std::env::var_os(variable).map_or_else(|| binaries.join(name), PathBuf::from))
+}
+
+async fn direct_stop(
+    config: &DemoConfig,
+    client: &Client,
+    statuses: &mut Subscription<ServiceStatus>,
+    results: &mut Subscription<ServiceLifecycleCommandStatus>,
+    exits: &mut tokio::sync::mpsc::UnboundedReceiver<ProcessExit>,
+) -> Result<(), String> {
+    if let Ok(exit) = exits.try_recv() {
+        return Err(exit.unexpected());
+    }
+    let command = config.stop_command(&config.driver, &config.commandee, &config.commandee)?;
+    let command_id = &command.message.message_data.command_id.uuid;
+    client
+        .send(&command)
+        .await
+        .map_err(|e| format!("direct STOP publication: {e}"))?;
+    println!("direct STOP publication acknowledged command={command_id}");
+    let mut result_seen = false;
+    let mut state_seen = false;
+    let mut exit_seen = false;
+    let deadline = Instant::now() + config.wait;
+    // Each required milestone has its own wait; unrelated reports never extend it.
+    while !(result_seen && state_seen && exit_seen) {
+        tokio::select! {
+            () = tokio::time::sleep_until(deadline) => {
+                let missing = [(result_seen, "terminal result"), (state_seen, "INOPERABLE"), (exit_seen, "process exit")]
+                    .into_iter().filter_map(|(seen, name)| (!seen).then_some(name)).collect::<Vec<_>>().join(", ");
+                return Err(format!("direct STOP deadline waiting for {missing}"));
+            }
+            result = results.next() => {
+                let result = result.ok_or("driver result stream ended before direct STOP completed")?.map_err(|e| e.to_string())?;
+                let header = &result.message.message_header;
+                let data = &result.message.message_data;
+                if data.command_id.uuid != *command_id || data.service_id.uuid != config.commandee.uuid {
+                    return Err("unexpected direct command result identity/correlation".into());
+                }
+                check_header(header, config, &config.commandee)?;
+                if result_seen { return Err("duplicate terminal direct command result".into()); }
+                if data.command_processing_state != CommandProcessingStateEnum::Accepted || data.lifecycle_command_status != ServiceLifecycleCommandStatusEnum::Success {
+                    return Err(format!("direct STOP failed: {:?}/{:?}", data.command_processing_state, data.lifecycle_command_status));
+                }
+                if header.timestamp == command.message.message_header.timestamp {
+                    return Err("direct result reused command header timestamp".into());
+                }
+                println!("observed direct result: ACCEPTED/SUCCESS command={command_id} processor={}", data.service_id.uuid);
+                result_seen = true;
+            }
+            report = statuses.next() => {
+                let report = report.ok_or("driver status stream ended before direct STOP completed")?.map_err(|e| e.to_string())?;
+                let data = &report.message.message_data;
+                if data.service_id.uuid == config.commandee.uuid {
+                    check_header(&report.message.message_header, config, &config.commandee)?;
+                    match data.service_state {
+                        ServiceStateEnum::Inoperable => {
+                            if state_seen { return Err("duplicate final INOPERABLE report".into()); }
+                            println!("observed commandee-service: INOPERABLE uuid={}", data.service_id.uuid);
+                            state_seen = true;
+                        }
+                        ServiceStateEnum::Normal if !state_seen => (),
+                        _ => return Err(format!("unexpected Commandee state {:?}", data.service_state)),
+                    }
+                } else if data.service_id.uuid == config.orchestrator.uuid {
+                    check_header(&report.message.message_header, config, &config.orchestrator)?;
+                    if data.service_state != ServiceStateEnum::Normal { return Err("Orchestrator did not remain NORMAL".into()); }
+                } else { return Err("unexpected reporting Service during direct STOP".into()); }
+            }
+            exit = exits.recv() => {
+                let exit = exit.ok_or("process observation ended")?;
+                if exit.name != "commandee-service" || !exit.status.as_ref().is_ok_and(std::process::ExitStatus::success) {
+                    return Err(exit.unexpected());
+                }
+                println!("observed commandee-service: successful process exit");
+                exit_seen = true;
+                // The process can exit while its already-delivered MSGs remain buffered.
+                // Keep requiring independent result/state observations within their deadlines.
+            }
+        }
+    }
+    // Observe a later periodic Orchestrator report, rather than infer availability
+    // from the lack of an exit event. Keep duplicate results visible during this wait.
+    let fresh_after = time::OffsetDateTime::now_utc();
+    timeout(config.wait, async {
+        loop {
+            tokio::select! {
+                result = results.next() => {
+                    result.ok_or("driver result stream ended")?.map_err(|e| e.to_string())?;
+                    return Err("unexpected additional command result after direct STOP".into());
+                }
+                exit = exits.recv() => return Err(exit.map_or_else(|| "process observation ended".into(), |exit| exit.unexpected())),
+                report = statuses.next() => {
+                    let report = report.ok_or("driver status stream ended")?.map_err(|e| e.to_string())?;
+                    if report.message.message_data.service_id.uuid != config.orchestrator.uuid {
+                        return Err("unexpected Commandee report after final INOPERABLE".into());
+                    }
+                    check_header(&report.message.message_header, config, &config.orchestrator)?;
+                    if report.message.message_data.service_state != ServiceStateEnum::Normal {
+                        return Err("Orchestrator did not remain NORMAL".into());
+                    }
+                    let timestamp = time::OffsetDateTime::parse(&report.message.message_header.timestamp,
+                        &time::format_description::well_known::Rfc3339).map_err(|e| format!("Orchestrator report timestamp: {e}"))?;
+                    if timestamp <= fresh_after { continue; }
+                    println!("observed orchestrator: still NORMAL after direct STOP");
+                    return Ok(());
+                }
+            }
+        }
+    }).await.map_err(|_| "Orchestrator post-STOP reporting deadline".to_string())?
+}
+
+fn check_header(
+    header: &la_cal_client::messages::uci_002_5::HeaderType,
+    config: &DemoConfig,
+    sender: &Identity,
+) -> Result<(), String> {
+    if header.service_id.as_ref().map(|id| &id.uuid) != Some(&sender.uuid)
+        || header.system_id.uuid != config.system_uuid
+        || header.mission_id.as_ref().map(|id| &id.uuid) != Some(&config.mission_uuid)
+    {
+        Err(format!(
+            "{} report has inconsistent sender/System/Mission",
+            sender.participant
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn unused_address() -> Result<SocketAddr, String> {

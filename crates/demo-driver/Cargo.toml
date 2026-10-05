@@ -16,9 +16,13 @@ owp-types = { path = "../owp-types" }
 serde_json = "1"
 tokio = { version = "1.53.2", features = ["full"] }
 tempfile = "3"
-time = { version = "0.3", features = ["formatting"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 toml = "1.1.6"
-uuid = "1"
+uuid = { version = "1", features = ["v4"] }
 
 [lints]
 workspace = true
+
+[[example]]
+name = "stop-test-peer"
+path = "tests/support/stop_peer.rs"

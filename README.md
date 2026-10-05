@@ -103,8 +103,8 @@ pinned schema is found. Applications live beside the driver binary.
 
 Each Service owns its client, required subscriptions and reporting loop directly.
 Configuration/payload helpers are shared, not a lifecycle runtime. The readiness
-driver sends no commands: STOP execution, relay and final verdict follow in
-tickets 21–23. Unexpected commands fail visibly rather than fabricate a result.
+driver sends no commands. The direct STOP slice below executes the Commandee's
+shutdown; the Orchestrator relay and final acceptance remain tickets 22–24.
 
 | Environment override | Default / range |
 | --- | --- |
@@ -128,9 +128,41 @@ DEMO_STATUS_SECONDS=2 DEMO_WAIT_MS=6000 target/debug/demo-driver --readiness
 See [`docs/service-readiness-evidence.md`](docs/service-readiness-evidence.md)
 for the native run, configuration, source grounding and coverage limits.
 
+## Direct Commandee STOP
+
+```sh
+cargo build --locked --workspace
+target/debug/demo-driver --direct-stop
+# Build the controlled public-message fixtures before the focused checks:
+cargo build --locked --workspace --examples
+cargo test --locked -p demo-driver --test direct_stop --test commandee_stop
+cargo test --locked -p commandee-service --test final_publications
+```
+
+As with readiness, put `zenohd` on PATH or set `ZENOHD`. The driver installs
+observations before launching both Services and observes their periodic NORMAL
+reports. It sends one NEW/STOP directly to the Commandee as both Effecting and
+Affected Service, then independently requires its correlated ACCEPTED/SUCCESS,
+final INOPERABLE and successful process exit. Neither message arrival order is
+assumed. The Orchestrator remains running and must report NORMAL again before
+the driver cleans up all remaining owned processes.
+
+The Commandee's minimal workload is an application-owned periodic unit counter;
+STOP ends that loop before final messaging. Only explicitly addressed NEW/STOP
+in the configured System/Mission with the Commandee as sole affected Service is
+eligible. Commands for other processors are ignored; targeted unsupported or
+ineligible requests receive one REJECTED/FAIL with a truthful diagnostic and leave
+the Service running. Result and state publications are separately awaited before
+bounded shared-client closure. Publication or closure failure exits unsuccessfully;
+there is no retry, recovery or duplicate suppression.
+
+See [`docs/direct-stop-evidence.md`](docs/direct-stop-evidence.md) for executed
+native milestones and test limits. This is not the relayed STOP acceptance.
+
 ## Checks and regeneration
 
 ```sh
+cargo build --locked --workspace --examples
 cargo check --locked --workspace --all-targets
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets
@@ -245,14 +277,14 @@ been run against the project server, and the acceptance scope is unchanged.
 | `owp-types` | Adopted OWP grammar/types and baseline UCI bindings/tests |
 | `baseline-client` | Unmodified upstream-style client used by copied socket tests; temporary adoption support |
 | `la-cal-client` | Cloneable async typed client, independent subscription streams and checked-in UCI 002.5.0 roots/dependencies |
-| `demo-driver` | Native process ownership, independent typed readiness observation, bounded cleanup and shared configuration/payload helpers |
+| `demo-driver` | Native process ownership, independent typed readiness/direct STOP observations, bounded cleanup and shared configuration/payload helpers |
 | `orchestrator` | Application-owned initialization, persistent command/result/status streams and reporting |
-| `commandee-service` | Application-owned initialization, persistent command stream and reporting |
+| `commandee-service` | Application-owned initialization, persistent command stream, targeting, direct STOP/final messaging and reporting |
 
 Tickets 18–19 complete client cancellation/deadline/drain verification, detected
 router-loss failure and the 64-message server queue/close-on-overflow contract.
-Ticket 20 supplies readiness/process ownership; STOP execution and relay remain
-subsequent tickets.
+Ticket 20 supplies readiness/process ownership; ticket 21 supplies direct STOP,
+final messaging and independent exit observation. Relay remains ticket 22.
 It is source-adoption evidence, not final prototype acceptance or a conformance
 claim. Plain `ws` retains the explicit RFC 6455 §10.6 TLS-capability exception.
 

@@ -5,8 +5,12 @@ use std::{env, time::Duration};
 use la_cal_client::{
     ClientConfig,
     messages::uci_002_5::{
-        HeaderType, MessageModeEnum, MissionIdType, ServiceIdType, ServiceStateEnum, ServiceStatus,
-        ServiceStatusMdt, ServiceStatusMt, SystemIdType,
+        CannotComplyTypeValue, CommandIdType, CommandProcessingStateEnum, CommandStateEnum,
+        HeaderType, MessageModeEnum, MissionIdType, ServiceIdType, ServiceLifecycleCommand,
+        ServiceLifecycleCommandMdt, ServiceLifecycleCommandMt, ServiceLifecycleCommandStatus,
+        ServiceLifecycleCommandStatusEnum, ServiceLifecycleCommandStatusMdt,
+        ServiceLifecycleCommandStatusMt, ServiceLifecycleStateEnum, ServiceStateEnum,
+        ServiceStatus, ServiceStatusMdt, ServiceStatusMt, SystemIdType,
     },
 };
 use uuid::Uuid;
@@ -163,6 +167,65 @@ impl DemoConfig {
                     predicted_service_state: vec![],
                     enabled_settings: vec![],
                     supported_settings: vec![],
+                },
+            },
+        })
+    }
+
+    /// Construct a NEW/STOP request with a fresh `CommandID` and actual sender.
+    pub fn stop_command(
+        &self,
+        sender: &Identity,
+        effecting: &Identity,
+        affected: &Identity,
+    ) -> Result<ServiceLifecycleCommand, String> {
+        let common = self
+            .status(sender, ServiceStateEnum::Normal, Duration::ZERO)?
+            .message;
+        Ok(ServiceLifecycleCommand {
+            message: ServiceLifecycleCommandMt {
+                security_information: common.security_information,
+                message_header: common.message_header.clone(),
+                message_data: ServiceLifecycleCommandMdt {
+                    command_id: CommandIdType {
+                        uuid: Uuid::new_v4().to_string(),
+                        descriptive_label: None,
+                    },
+                    command_state: CommandStateEnum::New,
+                    mission_id: common
+                        .message_header
+                        .mission_id
+                        .ok_or("missing MissionID")?,
+                    effecting_service_id: Some(effecting.service_id()),
+                    affected_service_id: vec![affected.service_id()],
+                    lifecycle_state: ServiceLifecycleStateEnum::Stop,
+                },
+            },
+        })
+    }
+
+    /// Format one terminal result; classification and matching belong to the application.
+    pub fn command_result(
+        &self,
+        processor: &Identity,
+        command_id: &CommandIdType,
+        processing: CommandProcessingStateEnum,
+        status: ServiceLifecycleCommandStatusEnum,
+        reason: Option<CannotComplyTypeValue>,
+    ) -> Result<ServiceLifecycleCommandStatus, String> {
+        let common = self
+            .status(processor, ServiceStateEnum::Normal, Duration::ZERO)?
+            .message;
+        Ok(ServiceLifecycleCommandStatus {
+            message: ServiceLifecycleCommandStatusMt {
+                security_information: common.security_information,
+                message_header: common.message_header,
+                message_data: ServiceLifecycleCommandStatusMdt {
+                    command_id: command_id.clone(),
+                    command_processing_state: processing,
+                    command_processing_state_reason: reason,
+                    lifecycle_command_status: status,
+                    service_id: processor.service_id(),
                 },
             },
         })

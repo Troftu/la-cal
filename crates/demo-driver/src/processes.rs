@@ -11,8 +11,19 @@ use tokio::{
 
 pub struct Processes {
     owned: Vec<Owned>,
-    exits: mpsc::UnboundedSender<String>,
+    exits: mpsc::UnboundedSender<ProcessExit>,
     wait: Duration,
+}
+
+pub struct ProcessExit {
+    pub name: &'static str,
+    pub status: Result<std::process::ExitStatus, String>,
+}
+
+impl ProcessExit {
+    pub fn unexpected(&self) -> String {
+        format!("unexpected {} exit: {:?}", self.name, self.status)
+    }
 }
 
 struct Owned {
@@ -23,7 +34,7 @@ struct Owned {
 }
 
 impl Processes {
-    pub fn new(wait: Duration) -> (Self, mpsc::UnboundedReceiver<String>) {
+    pub fn new(wait: Duration) -> (Self, mpsc::UnboundedReceiver<ProcessExit>) {
         let (exits, receiver) = mpsc::unbounded_channel();
         (
             Self {
@@ -58,8 +69,7 @@ impl Processes {
         let task = tokio::spawn(async move {
             tokio::select! {
                 status = child.wait() => {
-                    let message = format!("unexpected {name} exit: {status:?}");
-                    let _ = exits.send(message);
+                    let _ = exits.send(ProcessExit { name, status: status.as_ref().copied().map_err(ToString::to_string) });
                     status.map_err(|e| format!("reap {name}: {e}"))?;
                     println!("reaped {name} pid={pid}");
                     return Ok(());

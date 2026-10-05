@@ -75,7 +75,10 @@ async fn serve(client: &Client, config: &DemoConfig) -> Result<(), String> {
     loop {
         tokio::select! {
             command = commands.next() => {
-                command.ok_or("command stream ended unexpectedly")?.map_err(|e| e.to_string())?;
+                let command = command.ok_or("command stream ended unexpectedly")?.map_err(|e| e.to_string())?;
+                if command.message.message_data.effecting_service_id.as_ref().map(|id| &id.uuid) != Some(&config.orchestrator.uuid) {
+                    continue;
+                }
                 return Err("command relay is not implemented yet (ticket 22)".into());
             }
             result = results.next() => { result.ok_or("result stream ended unexpectedly")?.map_err(|e| e.to_string())?; }
