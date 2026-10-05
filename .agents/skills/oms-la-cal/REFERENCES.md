@@ -4,10 +4,12 @@ All paths are relative to the repository root. Read the branch relevant to the c
 
 ## Release Baselines
 
+- Project-selected OMS 2.5 / UCI 002.5.0 profile: `.scratch/rust-la-cal-prototype/issues/01-standards-profile.md#answer`; pinned runtime schema inputs: `spec/002.5.0/PROVENANCE.md`
 - OMS 2.5 release inventory: `standards-and-references/oms-standard/docs_official/01_OMSC-VDD-001_RevM_VersionDescriptionDocument_DandD_v2_5.docx`
 - UCI 2.6 release inventory: `standards-and-references/uci-standard/UCI Release Documentation - Standards Documents/01_UCI-VDD-001_Rev11_UCI_VersionDescriptionDocument_v2_6.docx`
 - SLEET implementation overview: `standards-and-references/sleet/README.md`
 - SLEET schema provenance and its pinned UCI 2.5 source: `standards-and-references/sleet/docs/schema-sourcing.md`
+- External LA-CAL harness schema provenance (also UCI 002.5.0): `standards-and-references/la-cal-harness/docs/schema-sourcing.md`
 
 The UCI README has stale/conflicting metadata: its badge says 2.5, while the delivered documents and schema are 2.6. Use the delivered VDD and schema package as the release evidence.
 
@@ -31,6 +33,20 @@ Implementation references:
 - Harness integration: `standards-and-references/sleet/docs/la-cal-harness-integration.md`
 
 Verify at least subprotocol negotiation, first-operation `INIT`, `+OK`/`-ERR` behavior, `INFO`, `PUB`, `SUB`, `UNSUB`, `MSG`, identifier grammar, subscription cleanup, and OMS JSON validation against the normative specification.
+
+## External LA-CAL Harness
+
+For retargeting tests, selecting validation depth, or interpreting reports:
+
+- Project assessment, inspected revision, adaptation risks and unrun coverage: `docs/la-cal-harness-assessment.md`
+- Native entry points: `standards-and-references/la-cal-harness/README.md`
+- Configuration contract: `standards-and-references/la-cal-harness/docs/configuration.md` and `standards-and-references/la-cal-harness/src/la_cal_harness/config.py`
+- Real/mock target selection and validation-tier/report fixtures: `standards-and-references/la-cal-harness/tests/conftest.py`
+- Test assertions: `standards-and-references/la-cal-harness/tests/cert/`
+- Schema-derived generation and variants: `standards-and-references/la-cal-harness/src/la_cal_harness/oms_json/`
+- Report aggregation: `standards-and-references/la-cal-harness/src/la_cal_harness/report.py`
+
+Read actual assertions and skips before using CERT labels or report summaries as coverage evidence. Keep the reference read-only; integration runs and adaptations belong in a separate working copy. Standalone preflight establishes OWP connectivity, not Service readiness or ASB delivery.
 
 ## OMS Service Lifecycle
 

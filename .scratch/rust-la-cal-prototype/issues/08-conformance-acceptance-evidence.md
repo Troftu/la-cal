@@ -51,6 +51,7 @@ WASIp3 compilation/execution and portability-driven dependency/adapter selection
 - 2026-10-04: User superseded the earlier mandatory repair/independent-assessment acceptance gates: retain known defects when they do not cause problems for the selected demonstration/tests; repair blockers encountered there. Do not require a separate comprehensive defect-remediation campaign merely to reach initial acceptance. Final operational wording and limited claim are awaiting confirmation.
 - 2026-10-04: Public upstream [LA-CAL harness README](https://gitlab.com/open-arsenal/ams-gra/hello-world-sk/test/la-cal-harness/-/raw/main/README.md) is accessible and documents native host targets, `LACAL_TARGET_URL`/`LACAL_CONFIG`, pinned UCI 2.5 inputs, preflight and configurable smoke/standard/exhaustive tiers. This establishes a documented retargeting route, not an executed macOS compatibility or three-root fixture result. Pin the actual revision used at implementation rather than treating mutable `main` or `latest` as the evidence baseline.
 - 2026-10-04: User approved the final six-part initial acceptance contract. Resolved as a planning decision; no prototype acceptance run has occurred.
+- 2026-10-05: User added the external harness reference. The [source assessment](../../../docs/la-cal-harness-assessment.md) records the pinned checkout and concrete retargeting/coverage risks, superseding the earlier source-unavailability observation. No harness run or change to the approved Answer is implied.
 
 ## Answer
 

@@ -180,6 +180,15 @@ Ticket 19's server validation, overflow, router-loss and bounded-cleanup checks
 and review results are in
 [`docs/server-failure-evidence.md`](docs/server-failure-evidence.md).
 
+## External CAL harness
+
+The read-only reference at `standards-and-references/la-cal-harness` is now
+available for practical protocol-test reuse. See
+[`docs/la-cal-harness-assessment.md`](docs/la-cal-harness-assessment.md) for its
+pinned revision, native retargeting route and adaptation/coverage limits.
+This is a source assessment only: no external harness preflight or suite has
+been run against the project server, and the acceptance scope is unchanged.
+
 ## Workspace and milestone
 
 | Package | Purpose at this milestone |

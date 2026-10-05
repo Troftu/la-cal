@@ -27,6 +27,7 @@ Settle an implementation-ready, easy-to-use native Rust LA-CAL client and a mini
 - ASB evidence must exercise the actual Zenoh/Protobuf adapter. The resolved shared-server topology retains SDK-local delivery; a physical router hop and multiple CAL Servers remain later work.
 - User selected a project-owned SLEET OWP frontend adaptation for `la-cal` and reuse of its generator for the three demo message roots. Track implemented modifications and pinned provenance in root [NOTICE](../../NOTICE), preserving upstream license/attribution and modified-file notices; the resolved interface ticket holds the adoption/interface contract.
 - Tickets are local Markdown children under `issues/`; open tickets are discovered there, not listed in this map. Follow `docs/agents/issue-tracker.md` for claims and blocking.
+- External CAL test reuse: the reference harness is now checked out and [its source assessment](../../docs/la-cal-harness-assessment.md) updates the implementation handoff as of 2026-10-05. Availability resolves the acquisition uncertainty, not execution or conformance; the approved acceptance decision and this completed planning map remain unchanged.
 
 ## Decisions so far
 
