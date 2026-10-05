@@ -5,7 +5,8 @@
 //!
 //! Modified 2026-10-04 from SLEET e3c2d798a229766571ed7be1f5b28d2dcdb51868:
 //! enforce the selected three-root topic policy. See ../../../NOTICE.
-//! Modified 2026-10-05: loopback Zenoh endpoint and bounded adapter waits.
+//! Modified 2026-10-05: loopback Zenoh endpoint, configurable router observation,
+//! and distinct bounded startup/operation/cleanup waits.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -35,8 +36,12 @@ pub struct ServerConfig {
     pub zenoh_router: String,
     /// Per-operation adapter deadline, including blocking validation/publication.
     pub asb_operation_timeout_ms: u64,
-    /// Deadline for session/router/subscriber startup and adapter cleanup.
+    /// Deadline for each session/router/subscriber startup wait.
     pub asb_startup_timeout_ms: u64,
+    /// Deadline for each resource cleanup wait, including runtime shutdown.
+    pub asb_cleanup_timeout_ms: u64,
+    /// Period between router-ZID connectivity snapshots.
+    pub asb_router_poll_interval_ms: u64,
     /// Socket address to bind the TCP listener on.
     pub bind_addr: SocketAddr,
     /// Unique server identifier (OWP identifier format).
@@ -321,6 +326,8 @@ struct RawServerConfig {
     zenoh_router: Option<String>,
     asb_operation_timeout_ms: Option<u64>,
     asb_startup_timeout_ms: Option<u64>,
+    asb_cleanup_timeout_ms: Option<u64>,
+    asb_router_poll_interval_ms: Option<u64>,
     bind_addr: Option<String>,
     server_id: Option<String>,
     system_label: Option<String>,
@@ -583,12 +590,17 @@ fn load_server_with_env(
     }
     let asb_operation_timeout_ms = raw.asb_operation_timeout_ms.unwrap_or(5_000);
     let asb_startup_timeout_ms = raw.asb_startup_timeout_ms.unwrap_or(5_000);
+    let asb_cleanup_timeout_ms = raw.asb_cleanup_timeout_ms.unwrap_or(5_000);
+    let asb_router_poll_interval_ms = raw.asb_router_poll_interval_ms.unwrap_or(100);
     if !(1..=60_000).contains(&asb_operation_timeout_ms)
         || !(1..=60_000).contains(&asb_startup_timeout_ms)
+        || !(1..=60_000).contains(&asb_cleanup_timeout_ms)
+        || !(1..=60_000).contains(&asb_router_poll_interval_ms)
     {
         return Err(ConfigError::InvalidAsb {
             path: server_path.to_path_buf(),
-            details: "ASB timeouts must be in 1..=60000 milliseconds".to_owned(),
+            details: "ASB timeouts and router poll interval must be in 1..=60000 milliseconds"
+                .to_owned(),
         });
     }
 
@@ -596,6 +608,8 @@ fn load_server_with_env(
         zenoh_router,
         asb_operation_timeout_ms,
         asb_startup_timeout_ms,
+        asb_cleanup_timeout_ms,
+        asb_router_poll_interval_ms,
         bind_addr,
         server_id,
         system_label,
@@ -930,6 +944,50 @@ mod tests {
     }
 
     // -- Valid loading --
+
+    #[test]
+    fn asb_wait_defaults_and_router_observation_are_configurable() {
+        let fix = TestFixture::new();
+        let path = fix.write_server("");
+        fix.write_default_service();
+        let cfg = load(&path).unwrap();
+        assert_eq!(cfg.server.asb_operation_timeout_ms, 5_000);
+        assert_eq!(cfg.server.asb_startup_timeout_ms, 5_000);
+        assert_eq!(cfg.server.asb_cleanup_timeout_ms, 5_000);
+        assert_eq!(cfg.server.asb_router_poll_interval_ms, 100);
+
+        let original = fs::read_to_string(&path).unwrap();
+        fs::write(
+            &path,
+            format!("{original}\nasb_cleanup_timeout_ms = 250\nasb_router_poll_interval_ms = 20\n"),
+        )
+        .unwrap();
+        let cfg = load(&path).unwrap();
+        assert_eq!(cfg.server.asb_cleanup_timeout_ms, 250);
+        assert_eq!(cfg.server.asb_router_poll_interval_ms, 20);
+    }
+
+    #[test]
+    fn asb_waits_reject_zero_and_unbounded_values() {
+        let fix = TestFixture::new();
+        let path = fix.write_server("");
+        fix.write_default_service();
+        let original = fs::read_to_string(&path).unwrap();
+        for field in [
+            "asb_operation_timeout_ms",
+            "asb_startup_timeout_ms",
+            "asb_cleanup_timeout_ms",
+            "asb_router_poll_interval_ms",
+        ] {
+            for value in [0, 60_001] {
+                fs::write(&path, format!("{original}\n{field} = {value}\n")).unwrap();
+                assert!(
+                    matches!(load(&path), Err(ConfigError::InvalidAsb { .. })),
+                    "{field} = {value}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn unsupported_topic_configuration_is_rejected() {

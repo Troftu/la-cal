@@ -9,3 +9,5 @@ services_dir = "config/services.d"
 zenoh_router = "tcp/127.0.0.1:7447"
 asb_operation_timeout_ms = 5000
 asb_startup_timeout_ms = 5000
+asb_cleanup_timeout_ms = 5000
+asb_router_poll_interval_ms = 100

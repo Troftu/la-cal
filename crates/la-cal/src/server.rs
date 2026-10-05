@@ -9,6 +9,8 @@
 //! connection I/O while an adapter publication is pending.
 //! Modified 2026-10-05 (ticket 17): flush the automatic WebSocket close reply
 //! before releasing the transport; verified through deployed typed client close.
+//! Modified 2026-10-05 (ticket 19): bounded 64-message connection queues,
+//! registration-aware delivery, RAII cleanup and cancellation-aware socket I/O.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -35,7 +37,7 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::asb::Adapter;
 use crate::config::{Config, SUPPORTED_TOPICS, ServiceConfig};
-use crate::router::{Router, RouterError, Subscription};
+use crate::router::{Delivery, Router, RouterError, Subscription};
 use crate::schema::model::Schema;
 use sleet_types::owp::{ClientOp, InfoPayload, InitPayload, OwpError, ServerOp};
 
@@ -72,12 +74,17 @@ pub async fn run(
     active_connections: Arc<AtomicU64>,
     ready: Arc<AtomicBool>,
 ) -> Result<(), ServerError> {
+    ready.store(false, Ordering::Relaxed);
+    let _readiness = ReadinessGuard(Arc::clone(&ready));
+    // Adapter failures cancel this child, not the operator's shutdown token.
+    // The latched failure below also covers loss racing operator shutdown.
+    let asb_failure = shutdown.child_token();
     let adapter = Arc::new(
         Adapter::open(
             &config.server,
             Arc::clone(&schema),
             Arc::clone(&router),
-            shutdown.clone(),
+            asb_failure.clone(),
         )
         .await
         .map_err(ServerError::Asb)?,
@@ -90,15 +97,23 @@ pub async fn run(
         shutdown,
         active_connections,
         ready,
+        asb_failure,
     )
     .await;
     let mut adapter = Arc::try_unwrap(adapter)
         .map_err(|_| ServerError::Asb("adapter still owned after connection drain".to_owned()))?;
     let cleanup = adapter.close().await.map_err(ServerError::Asb);
+    let outcome = adapter
+        .failure()
+        .map_or(outcome, |details| Err(ServerError::Asb(details)));
     outcome.and(cleanup)
 }
 
-#[allow(clippy::too_many_arguments, clippy::significant_drop_tightening)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::significant_drop_tightening,
+    clippy::too_many_lines
+)]
 async fn run_frontend(
     config: Arc<Config>,
     schema: Arc<Schema>,
@@ -107,7 +122,18 @@ async fn run_frontend(
     shutdown: CancellationToken,
     active_connections: Arc<AtomicU64>,
     ready: Arc<AtomicBool>,
+    asb_failure: CancellationToken,
 ) -> Result<(), ServerError> {
+    if shutdown.is_cancelled() {
+        return Ok(());
+    }
+    if asb_failure.is_cancelled() {
+        return Err(ServerError::Asb(
+            adapter
+                .failure()
+                .unwrap_or_else(|| "ASB failed before OWP admission".to_owned()),
+        ));
+    }
     let listener = TcpListener::bind(config.server.bind_addr)
         .await
         .map_err(ServerError::Bind)?;
@@ -117,10 +143,21 @@ async fn run_frontend(
     let mut connections: JoinSet<()> = JoinSet::new();
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(config.server.max_connections));
     let mut permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
+    // This token inherits both operator shutdown and detected adapter failure,
+    // interrupting socket writes without waiting for the accept loop to poll.
+    let connection_shutdown = asb_failure.child_token();
+    let mut outcome = Ok(());
 
     loop {
         tokio::select! {
+            biased;
             () = shutdown.cancelled() => {
+                break;
+            }
+            () = asb_failure.cancelled() => {
+                error!("ASB infrastructure failure; stopping admission and closing clients");
+                outcome = Err(ServerError::Asb(adapter.failure().unwrap_or_else(||
+                    "ASB infrastructure failed during run".to_owned())));
                 break;
             }
             Some(res) = connections.join_next() => {
@@ -142,7 +179,7 @@ async fn run_frontend(
                 let router = Arc::clone(&router);
                 let adapter = Arc::clone(adapter);
                 let next_conn_id = Arc::clone(&next_conn_id);
-                let conn_shutdown = shutdown.clone();
+                let conn_shutdown = connection_shutdown.clone();
                 let active_connections = Arc::clone(&active_connections);
 
                 connections.spawn(async move {
@@ -155,7 +192,12 @@ async fn run_frontend(
                     );
 
                     async move {
-                        let Ok(ws_stream) = upgrade_with_subprotocol(stream, &config).await else {
+                        let upgrade = tokio::select! {
+                            biased;
+                            () = conn_shutdown.cancelled() => return,
+                            result = upgrade_with_subprotocol(stream, &config) => result,
+                        };
+                        let Ok(ws_stream) = upgrade else {
                             return;
                         };
 
@@ -184,6 +226,7 @@ async fn run_frontend(
     }
 
     ready.store(false, Ordering::Relaxed);
+    connection_shutdown.cancel();
 
     let active_count = connections.len();
     info!(
@@ -203,10 +246,21 @@ async fn run_frontend(
             drain_seconds = config.server.shutdown_drain_seconds,
             "shutdown drain expired; aborting remaining connection tasks"
         );
-        connections.shutdown().await;
+        connections.abort_all();
+        // Aborted async tasks only need to drop their guards; no blocking
+        // publication worker is joined by connection cleanup.
+        let cleanup = Duration::from_millis(config.server.asb_cleanup_timeout_ms);
+        if time::timeout(cleanup, async {
+            while connections.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            warn!("connection task cleanup deadline");
+        }
     }
 
-    Ok(())
+    outcome
 }
 
 /// Perform the WebSocket handshake, enforcing the `owp` subprotocol.
@@ -223,7 +277,7 @@ async fn upgrade_with_subprotocol(
 
     #[allow(clippy::result_large_err)]
     let handshake_result = time::timeout(
-        Duration::from_secs(10),
+        Duration::from_millis(config.server.asb_operation_timeout_ms),
         accept_hdr_async_with_config(
             stream,
             |request: &Request, mut response: Response| {
@@ -289,6 +343,67 @@ enum ConnectionState {
     },
 }
 
+struct ReadinessGuard(Arc<AtomicBool>);
+
+impl Drop for ReadinessGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
+struct ActiveConnectionGuard(Arc<AtomicU64>);
+
+impl Drop for ActiveConnectionGuard {
+    fn drop(&mut self) {
+        track_connection_closed(&self.0);
+    }
+}
+
+/// Deadlines and cancellation apply to every socket write, including replies.
+struct ConnectionSocket {
+    ws: WebSocketStream<TcpStream>,
+    write_timeout: Duration,
+    close_timeout: Duration,
+    failed: CancellationToken,
+    shutdown: CancellationToken,
+}
+
+impl ConnectionSocket {
+    async fn send(&mut self, message: Message) -> Result<(), String> {
+        tokio::select! {
+            biased;
+            () = self.failed.cancelled() => Err("outbound queue overflow; connection failed".to_owned()),
+            () = self.shutdown.cancelled() => Err("server shutting down".to_owned()),
+            result = time::timeout(self.write_timeout, self.ws.send(message)) => {
+                result.map_err(|_| "socket write deadline".to_owned())?
+                    .map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    async fn close(&mut self, code: CloseCode, reason: &'static str) {
+        let frame = Message::Close(Some(CloseFrame {
+            code,
+            reason: reason.into(),
+        }));
+        if !matches!(
+            time::timeout(self.close_timeout, self.ws.send(frame)).await,
+            Ok(Ok(()))
+        ) {
+            warn!("websocket closure failed or exceeded deadline");
+        }
+    }
+
+    async fn flush_close_reply(&mut self) {
+        if !matches!(
+            time::timeout(self.close_timeout, self.ws.flush()).await,
+            Ok(Ok(()))
+        ) {
+            warn!("websocket close reply failed or exceeded deadline");
+        }
+    }
+}
+
 /// Run the main loop for a single WebSocket connection.
 ///
 /// Multiplexes between reading client frames and delivering outbound MSG
@@ -305,9 +420,18 @@ async fn handle_connection(
     active_connections: Arc<AtomicU64>,
 ) -> Result<(), String> {
     track_connection_opened(&active_connections);
+    let _active = ActiveConnectionGuard(active_connections);
+    let registrations = router.connection_guard(connection_id);
+    let mut socket = ConnectionSocket {
+        ws,
+        write_timeout: Duration::from_millis(config.server.asb_operation_timeout_ms),
+        close_timeout: Duration::from_millis(config.server.asb_cleanup_timeout_ms),
+        failed: registrations.failure_token(),
+        shutdown: shutdown.clone(),
+    };
 
     let result = connection_loop(
-        ws,
+        &mut socket,
         config,
         schema,
         router.as_ref(),
@@ -317,8 +441,12 @@ async fn handle_connection(
     )
     .await;
 
+    // Dispose remaining registrations before the error-close write.
     router.remove_connection(connection_id).await;
-    track_connection_closed(&active_connections);
+    drop(registrations);
+    if result.is_err() {
+        socket.close(CloseCode::Error, "connection failed").await;
+    }
     info!("disconnected");
     result
 }
@@ -327,7 +455,7 @@ type PendingPublication = Pin<Box<dyn Future<Output = Result<(), (OwpError, Stri
 
 #[allow(clippy::too_many_lines)]
 async fn connection_loop(
-    mut ws: WebSocketStream<TcpStream>,
+    ws: &mut ConnectionSocket,
     config: Arc<Config>,
     schema: Arc<Schema>,
     router: &Router,
@@ -336,22 +464,35 @@ async fn connection_loop(
     shutdown: CancellationToken,
 ) -> Result<(), String> {
     let mut state = ConnectionState::AwaitingInit;
+    let failed = ws.failed.clone();
     let mut publication: Option<PendingPublication> = None;
     let mut queued_frames: VecDeque<String> = VecDeque::new();
-    let (msg_tx, mut msg_rx) = mpsc::channel::<ServerOp>(1024);
+    let (msg_tx, mut msg_rx) = mpsc::channel::<Delivery>(64);
     let idle_enabled = config.server.idle_timeout_seconds > 0;
     let idle_period = Duration::from_secs(config.server.idle_timeout_seconds.max(1));
     let mut idle_interval = time::interval_at(time::Instant::now() + idle_period, idle_period);
     let mut awaiting_pong = false;
     let mut last_activity = time::Instant::now();
-    let mut init_timeout = Box::pin(time::sleep(Duration::from_secs(10)));
+    let mut init_timeout = Box::pin(time::sleep(Duration::from_millis(
+        config.server.asb_operation_timeout_ms,
+    )));
 
     loop {
+        // Check terminal signals before processing queued operations. Otherwise
+        // already-buffered PUB frames could start after the connection failed.
+        if failed.is_cancelled() {
+            ws.close(CloseCode::Error, "outbound queue overflow").await;
+            break;
+        }
+        if shutdown.is_cancelled() {
+            ws.close(CloseCode::Away, "server shutting down").await;
+            break;
+        }
         if publication.is_none()
             && let Some(text) = queued_frames.pop_front()
         {
             if handle_text_frame(
-                &mut ws,
+                ws,
                 &mut state,
                 &text,
                 &config,
@@ -369,33 +510,29 @@ async fn connection_loop(
             continue;
         }
         tokio::select! {
+            () = failed.cancelled() => {
+                ws.close(CloseCode::Error, "outbound queue overflow").await;
+                break;
+            }
+            () = shutdown.cancelled() => {
+                info!("shutdown requested; closing websocket");
+                ws.close(CloseCode::Away, "server shutting down").await;
+                break;
+            }
             result = async { publication.as_mut().expect("pending publication").await }, if publication.is_some() => {
                 publication = None;
                 match result {
                     Ok(()) => {
                         if matches!(state, ConnectionState::Active { verbose: true, .. }) {
-                            send_server_op(&mut ws, ServerOp::Ok).await?;
+                            send_server_op(ws, ServerOp::Ok).await?;
                         }
                     }
-                    Err((error, details)) => send_err(&mut ws, error, details).await?,
+                    Err((error, details)) => send_err(ws, error, details).await?,
                 }
             }
             () = &mut init_timeout, if matches!(state, ConnectionState::AwaitingInit) => {
                 warn!("timeout waiting for INIT frame");
-                let close = Message::Close(Some(CloseFrame {
-                    code: CloseCode::Policy,
-                    reason: "INIT timeout".into(),
-                }));
-                let _ = time::timeout(Duration::from_secs(5), ws.send(close)).await;
-                break;
-            }
-            () = shutdown.cancelled() => {
-                info!("shutdown requested; closing websocket");
-                let close = Message::Close(Some(CloseFrame {
-                    code: CloseCode::Away,
-                    reason: "server shutting down".into(),
-                }));
-                let _ = time::timeout(Duration::from_secs(5), ws.send(close)).await;
+                ws.close(CloseCode::Policy, "INIT timeout").await;
                 break;
             }
             _ = idle_interval.tick(), if idle_enabled => {
@@ -406,37 +543,24 @@ async fn connection_loop(
 
                 if awaiting_pong {
                     info!("idle timeout reached; closing websocket");
-                    let close = Message::Close(Some(CloseFrame {
-                        code: CloseCode::Away,
-                        reason: "idle timeout".into(),
-                    }));
-                    let _ = time::timeout(Duration::from_secs(5), ws.send(close)).await;
+                    ws.close(CloseCode::Away, "idle timeout").await;
                     break;
                 }
 
                 awaiting_pong = true;
-                let _ = time::timeout(Duration::from_secs(5), ws.send(Message::Ping(Vec::new().into()))).await;
+                ws.send(Message::Ping(Vec::new().into())).await?;
             }
             outbound = msg_rx.recv() => {
                 match outbound {
-                    Some(op) => {
-                        let send_fut = ws.send(Message::Text(op.to_string().into()));
-                        match time::timeout(Duration::from_secs(5), send_fut).await {
-                            Ok(Err(e)) => {
-                                warn!(error = %e, "ws send failed");
-                                break;
-                            }
-                            Err(_) => {
-                                warn!("ws send timed out; dropping slow client");
-                                break;
-                            }
-                            Ok(Ok(())) => {}
+                    Some(delivery) => {
+                        if let Some(op) = delivery.into_op() {
+                            send_server_op(ws, op).await?;
                         }
                     }
                     None => break,
                 }
             }
-            inbound = ws.next() => {
+            inbound = ws.ws.next() => {
                 match inbound {
                     Some(Ok(Message::Text(text))) => {
                         awaiting_pong = false;
@@ -458,7 +582,7 @@ async fn connection_loop(
                             continue;
                         }
                         let should_fail = handle_text_frame(
-                            &mut ws,
+                            ws,
                             &mut state,
                             &text,
                             &config,
@@ -479,7 +603,7 @@ async fn connection_loop(
                         last_activity = time::Instant::now();
                         warn!("binary frame rejected");
                         send_err(
-                            &mut ws,
+                            ws,
                             OwpError::IllegalOperation,
                             "binary frames are not supported".to_owned(),
                         )
@@ -488,18 +612,7 @@ async fn connection_loop(
                     Some(Ok(Message::Ping(payload))) => {
                         awaiting_pong = false;
                         last_activity = time::Instant::now();
-                        let pong_fut = ws.send(Message::Pong(payload));
-                        match time::timeout(Duration::from_secs(5), pong_fut).await {
-                            Ok(Err(e)) => {
-                                warn!(error = %e, "ws pong send failed");
-                                break;
-                            }
-                            Err(_) => {
-                                warn!("ws pong send timed out; dropping slow client");
-                                break;
-                            }
-                            Ok(Ok(())) => {}
-                        }
+                        ws.send(Message::Pong(payload)).await?;
                     }
                     Some(Ok(Message::Pong(_) | Message::Frame(_))) => {
                         awaiting_pong = false;
@@ -508,7 +621,7 @@ async fn connection_loop(
                     Some(Ok(Message::Close(_))) => {
                         // Tungstenite queues the close reply while reading. Dropping
                         // without flushing resets a correctly closing client's socket.
-                        let _ = time::timeout(Duration::from_secs(5), ws.flush()).await;
+                        ws.flush_close_reply().await;
                         break;
                     }
                     Some(Err(_)) | None => break,
@@ -542,7 +655,7 @@ fn set_active_connections_metric(count: u64) {
 /// Returns `Ok(true)` when the connection should be failed (closed).
 #[allow(clippy::too_many_arguments)]
 async fn handle_text_frame(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut ConnectionSocket,
     state: &mut ConnectionState,
     text: &str,
     config: &Config,
@@ -551,7 +664,7 @@ async fn handle_text_frame(
     adapter: &Arc<Adapter>,
     publication: &mut Option<PendingPublication>,
     connection_id: u64,
-    msg_tx: &mpsc::Sender<ServerOp>,
+    msg_tx: &mpsc::Sender<Delivery>,
 ) -> Result<bool, String> {
     match state {
         ConnectionState::AwaitingInit => handle_awaiting_init(ws, state, text, config).await,
@@ -577,7 +690,7 @@ async fn handle_text_frame(
 ///
 /// Returns `Ok(true)` to signal the connection should be failed (closed).
 async fn handle_awaiting_init(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut ConnectionSocket,
     state: &mut ConnectionState,
     text: &str,
     config: &Config,
@@ -627,7 +740,7 @@ async fn handle_awaiting_init(
 /// Returns `Ok(true)` to signal the connection should be failed (closed).
 #[allow(clippy::too_many_arguments)]
 async fn handle_active(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut ConnectionSocket,
     text: &str,
     service: &Arc<ServiceConfig>,
     verbose: bool,
@@ -636,7 +749,7 @@ async fn handle_active(
     adapter: &Arc<Adapter>,
     publication: &mut Option<PendingPublication>,
     connection_id: u64,
-    msg_tx: &mpsc::Sender<ServerOp>,
+    msg_tx: &mpsc::Sender<Delivery>,
 ) -> Result<bool, String> {
     let parsed = match sleet_types::owp::parse(text) {
         Ok(op) => op,
@@ -812,7 +925,7 @@ struct SubRequest {
     topic: String,
     group: Option<String>,
     connection_id: u64,
-    sender: mpsc::Sender<ServerOp>,
+    sender: mpsc::Sender<Delivery>,
 }
 
 /// Process a SUB operation: authorize topic, validate message name, register subscription.
@@ -881,6 +994,10 @@ async fn process_sub(
                 OwpError::IllegalState,
                 "maximum subscriptions reached for this connection".to_owned(),
             ),
+            RouterError::ConnectionClosed => (
+                OwpError::InternalError,
+                "connection already failed".to_owned(),
+            ),
         })?;
 
     debug!(sid = %sid_for_log, topic = %topic_for_log, message_name = %name_for_log, "subscription registered");
@@ -909,6 +1026,10 @@ async fn process_unsub(
                 OwpError::InternalError,
                 "router inconsistency during unsubscribe".to_owned(),
             ),
+            RouterError::ConnectionClosed => (
+                OwpError::InternalError,
+                "connection already failed".to_owned(),
+            ),
         })?;
 
     debug!(sid = %sid, "subscription removed");
@@ -916,7 +1037,7 @@ async fn process_unsub(
 }
 
 /// Serialize and send a server operation as a WebSocket text frame.
-async fn send_server_op(ws: &mut WebSocketStream<TcpStream>, op: ServerOp) -> Result<(), String> {
+async fn send_server_op(ws: &mut ConnectionSocket, op: ServerOp) -> Result<(), String> {
     let op_name = match &op {
         ServerOp::Info(_) => "INFO",
         ServerOp::Msg { .. } => "MSG",
@@ -928,20 +1049,14 @@ async fn send_server_op(ws: &mut WebSocketStream<TcpStream>, op: ServerOp) -> Re
 
     let payload = op.to_string();
     let bytes_len = payload.len();
-    let send_fut = ws.send(Message::Text(payload.into()));
-    match time::timeout(Duration::from_secs(5), send_fut).await {
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(_) => Err("send timed out".to_owned()),
-        Ok(Ok(())) => {
-            metrics::counter!("sleet_websocket_bytes_sent_total").increment(bytes_len as u64);
-            Ok(())
-        }
-    }
+    ws.send(Message::Text(payload.into())).await?;
+    metrics::counter!("sleet_websocket_bytes_sent_total").increment(bytes_len as u64);
+    Ok(())
 }
 
 /// Send a `-ERR` operation and emit a matching warning log line.
 async fn send_err(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut ConnectionSocket,
     error: OwpError,
     details: String,
 ) -> Result<(), String> {
@@ -1006,20 +1121,9 @@ mod tests {
         active_connections: Arc<AtomicU64>,
         ready: Arc<AtomicBool>,
     ) {
-        let port = pick_free_port().unwrap();
-        let router_config = zenoh::Config::from_json5(&format!(
-            r#"{{
-            mode: "router", listen: {{ endpoints: ["tcp/127.0.0.1:{port}"] }},
-            scouting: {{ multicast: {{ enabled: false }}, gossip: {{ enabled: false }} }}
-        }}"#
-        ))
-        .unwrap();
-        let zenoh_router = timeout(Duration::from_secs(5), zenoh::open(router_config))
-            .await
-            .unwrap()
-            .unwrap();
+        let (zenoh_router, endpoint) = open_test_router().await;
         let mut cfg = (*cfg).clone();
-        cfg.server.zenoh_router = format!("tcp/127.0.0.1:{port}");
+        cfg.server.zenoh_router = endpoint;
         super::run(
             Arc::new(cfg),
             schema,
@@ -1034,6 +1138,22 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    async fn open_test_router() -> (zenoh::Session, String) {
+        let port = pick_free_port().unwrap();
+        let router_config = zenoh::Config::from_json5(&format!(
+            r#"{{
+            mode: "router", listen: {{ endpoints: ["tcp/127.0.0.1:{port}"] }},
+            scouting: {{ multicast: {{ enabled: false }}, gossip: {{ enabled: false }} }}
+        }}"#
+        ))
+        .unwrap();
+        let zenoh_router = timeout(Duration::from_secs(5), zenoh::open(router_config))
+            .await
+            .unwrap()
+            .unwrap();
+        (zenoh_router, format!("tcp/127.0.0.1:{port}"))
     }
 
     fn init_frame(service_id: &str) -> tokio_tungstenite::tungstenite::Utf8Bytes {
@@ -1115,10 +1235,43 @@ mod tests {
         svc_topic_bindings: &[(&str, &str)],
     ) -> (u16, CancellationToken, JoinHandle<()>) {
         let port = pick_free_port().expect("pick free port");
+        let (cfg, schema) = test_config(port, idle_timeout_seconds, svc_topic_bindings);
+        let router = Arc::new(Router::new());
 
+        let shutdown = CancellationToken::new();
+        let shutdown_for_server = shutdown.clone();
+        let ready = Arc::new(AtomicBool::new(false));
+        let readiness = Arc::clone(&ready);
+        let handle = native_runtime().spawn(async move {
+            run_test_server(
+                cfg,
+                schema,
+                router,
+                shutdown_for_server,
+                Arc::new(AtomicU64::new(0)),
+                ready,
+            )
+            .await;
+        });
+
+        timeout(Duration::from_secs(5), async {
+            while !readiness.load(std::sync::atomic::Ordering::Relaxed) {
+                assert!(!handle.is_finished(), "server exited before readiness");
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bounded ASB-backed server readiness");
+        (port, shutdown, handle)
+    }
+
+    fn test_config(
+        port: u16,
+        idle_timeout_seconds: Option<u64>,
+        svc_topic_bindings: &[(&str, &str)],
+    ) -> (Arc<config::Config>, Arc<crate::schema::model::Schema>) {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().to_path_buf();
-        std::mem::forget(temp);
         let schema_path = root.join("schema.xsd");
         let services_dir = root.join("services.d");
         std::fs::create_dir_all(&services_dir).expect("create services dir");
@@ -1186,35 +1339,7 @@ mod tests {
         }
         let cfg = Arc::new(cfg);
         let schema = Arc::new(parser::parse(&schema_path).expect("parse schema"));
-        let router = Arc::new(Router::new());
-
-        let shutdown = CancellationToken::new();
-        let shutdown_for_server = shutdown.clone();
-        let handle = native_runtime().spawn(async move {
-            let active_connections = Arc::new(AtomicU64::new(0));
-            let ready = Arc::new(AtomicBool::new(false));
-            run_test_server(
-                cfg,
-                schema,
-                router,
-                shutdown_for_server,
-                active_connections,
-                ready,
-            )
-            .await;
-        });
-
-        for _ in 0..50 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_ok()
-            {
-                break;
-            }
-            sleep(Duration::from_millis(20)).await;
-        }
-
-        (port, shutdown, handle)
+        (cfg, schema)
     }
 
     async fn shutdown_server(shutdown: CancellationToken, handle: JoinHandle<()>) {
@@ -1287,7 +1412,10 @@ mod tests {
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
     ) {
-        match ws.next().await {
+        match timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("bounded socket disconnect")
+        {
             None | Some(Err(_) | Ok(Message::Close(_))) => {}
             other => panic!("expected disconnect, got {other:?}"),
         }
@@ -1346,6 +1474,348 @@ mod tests {
         assert!(acknowledged && delivered);
     }
 
+    type TestSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// Real sockets with connection tasks on this test's current-thread runtime.
+    /// This lets the routing seam deterministically enqueue a burst before the
+    /// socket task drains it. These bursts are local routing evidence; the later
+    /// adapter publications explicitly traverse the real Zenoh subscriber.
+    struct SocketFixture {
+        config: Arc<config::Config>,
+        schema: Arc<crate::schema::model::Schema>,
+        router: Arc<Router>,
+        adapter: Option<Arc<super::Adapter>>,
+        zenoh_router: Option<zenoh::Session>,
+        shutdown: CancellationToken,
+        active: Arc<AtomicU64>,
+    }
+
+    impl SocketFixture {
+        async fn open() -> Self {
+            let (cfg, schema) = test_config(0, None, &[]);
+            let mut cfg = (*cfg).clone();
+            let (zenoh_router, endpoint) =
+                native_runtime().spawn(open_test_router()).await.unwrap();
+            cfg.server.zenoh_router = endpoint;
+            cfg.server.asb_operation_timeout_ms = 100;
+            cfg.server.max_write_buffer_size = 32 * 1024 * 1024;
+            let router = Arc::new(Router::new());
+            let shutdown = CancellationToken::new();
+            let mut config = Arc::new(cfg);
+            let adapter = {
+                let config = Arc::clone(&config);
+                let schema = Arc::clone(&schema);
+                let router = Arc::clone(&router);
+                let shutdown = shutdown.clone();
+                native_runtime()
+                    .spawn(async move {
+                        super::Adapter::open(&config.server, schema, router, shutdown)
+                            .await
+                            .unwrap()
+                    })
+                    .await
+                    .unwrap()
+            };
+            Arc::get_mut(&mut config)
+                .unwrap()
+                .server
+                .asb_cleanup_timeout_ms = 100;
+            Self {
+                config,
+                schema,
+                router,
+                adapter: Some(Arc::new(adapter)),
+                zenoh_router: Some(zenoh_router),
+                shutdown,
+                active: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        async fn connect(&self, id: u64) -> (TestSocket, JoinHandle<Result<(), String>>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = async {
+                let (stream, _) = listener.accept().await.unwrap();
+                super::upgrade_with_subprotocol(stream, &self.config)
+                    .await
+                    .unwrap()
+            };
+            let (server, mut client) = tokio::join!(server, connect_with_owp(port));
+            let config = Arc::clone(&self.config);
+            let schema = Arc::clone(&self.schema);
+            let router = Arc::clone(&self.router);
+            let adapter = Arc::clone(self.adapter.as_ref().unwrap());
+            let shutdown = self.shutdown.clone();
+            let active = Arc::clone(&self.active);
+            let task = tokio::spawn(super::handle_connection(
+                server, config, schema, router, adapter, id, shutdown, active,
+            ));
+            init_verbose(&mut client, "svc1").await;
+            (client, task)
+        }
+
+        async fn close(mut self) {
+            self.shutdown.cancel();
+            let adapter = self.adapter.take().unwrap();
+            let zenoh_router = self.zenoh_router.take().unwrap();
+            native_runtime()
+                .spawn(async move {
+                    let mut adapter = Arc::try_unwrap(adapter)
+                        .ok()
+                        .expect("connection tasks disposed");
+                    adapter.close().await.unwrap();
+                    timeout(Duration::from_secs(2), zenoh_router.close())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    impl Drop for SocketFixture {
+        fn drop(&mut self) {
+            self.shutdown.cancel();
+            let adapter = self.adapter.take();
+            let router = self.zenoh_router.take();
+            // Zenoh's synchronous Drop also requires a multi-thread runtime,
+            // including when a regression assertion panics before explicit close.
+            native_runtime().spawn(async move {
+                drop(adapter);
+                drop(router);
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_overflow_closes_only_failed_connection_and_shared_listener_survives() {
+        let fixture = SocketFixture::open().await;
+        let (mut slow, slow_task) = fixture.connect(1).await;
+        let (mut healthy, healthy_task) = fixture.connect(2).await;
+        for frame in [
+            "SUB slow ServiceStatus ServiceStatus",
+            "SUB other ServiceLifecycleCommand ServiceLifecycleCommand workers",
+        ] {
+            slow.send(Message::text(frame)).await.unwrap();
+            assert!(matches!(recv_parsed(&mut slow).await, ServerOp::Ok));
+        }
+        healthy
+            .send(Message::text("SUB healthy ServiceStatus ServiceStatus"))
+            .await
+            .unwrap();
+        assert!(matches!(recv_parsed(&mut healthy).await, ServerOp::Ok));
+        for _ in 0..65 {
+            fixture
+                .router
+                .publish(
+                    "ServiceLifecycleCommand",
+                    "ServiceLifecycleCommand",
+                    "queued",
+                )
+                .await;
+        }
+        let closed = timeout(Duration::from_secs(2), slow.next()).await.unwrap();
+        assert!(
+            matches!(closed, Some(Ok(Message::Close(Some(frame)))) if frame.code == super::CloseCode::Error)
+        );
+        timeout(Duration::from_secs(2), slow_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        for sid in ["slow", "other"] {
+            assert_eq!(
+                fixture.router.unsubscribe(1, sid).await,
+                Err(crate::router::RouterError::UnknownSid(sid.to_owned()))
+            );
+        }
+        // A surviving connection still publishes and receives through the one
+        // real ASB listener after the slow connection has been disposed.
+        healthy
+            .send(Message::text("PUB ServiceStatus {\"ServiceStatus\":{}}"))
+            .await
+            .unwrap();
+        expect_publication_delivery(&mut healthy, "healthy", "{\"ServiceStatus\":{}}").await;
+        fixture.shutdown.cancel();
+        timeout(Duration::from_secs(2), healthy_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(fixture.active.load(std::sync::atomic::Ordering::Relaxed), 0);
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn forced_socket_task_abort_cleans_up_registrations_and_connection_count() {
+        let fixture = SocketFixture::open().await;
+        let (mut client, task) = fixture.connect(1).await;
+        for frame in [
+            "SUB direct ServiceStatus ServiceStatus",
+            "SUB grouped ServiceStatus ServiceStatus workers",
+        ] {
+            client.send(Message::text(frame)).await.unwrap();
+            assert!(matches!(recv_parsed(&mut client).await, ServerOp::Ok));
+        }
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        for sid in ["direct", "grouped"] {
+            assert_eq!(
+                fixture.router.unsubscribe(1, sid).await,
+                Err(crate::router::RouterError::UnknownSid(sid.to_owned()))
+            );
+        }
+        assert_eq!(fixture.active.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_disconnected(&mut client).await;
+        let (mut survivor, survivor_task) = fixture.connect(2).await;
+        survivor
+            .send(Message::text("SUB retained ServiceStatus ServiceStatus"))
+            .await
+            .unwrap();
+        assert!(matches!(recv_parsed(&mut survivor).await, ServerOp::Ok));
+        survivor
+            .send(Message::text("PUB ServiceStatus {\"ServiceStatus\":{}}"))
+            .await
+            .unwrap();
+        expect_publication_delivery(&mut survivor, "retained", "{\"ServiceStatus\":{}}").await;
+        fixture.shutdown.cancel();
+        timeout(Duration::from_secs(2), survivor_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn stalled_socket_write_and_close_are_bounded_and_dispose_registrations() {
+        let fixture = SocketFixture::open().await;
+        let (mut client, task) = fixture.connect(1).await;
+        client
+            .send(Message::text("SUB stalled ServiceStatus ServiceStatus"))
+            .await
+            .unwrap();
+        assert!(matches!(recv_parsed(&mut client).await, ServerOp::Ok));
+        // Large enough to exceed TCP buffering while this peer stops reading.
+        // The transport seam, not ASB validation, supplies this backpressure.
+        fixture
+            .router
+            .publish(
+                "ServiceStatus",
+                "ServiceStatus",
+                &"x".repeat(16 * 1024 * 1024),
+            )
+            .await;
+        let result = timeout(Duration::from_secs(2), task)
+            .await
+            .expect("write plus close deadlines bound the connection task")
+            .unwrap();
+        assert_eq!(result, Err("socket write deadline".to_owned()));
+        assert_eq!(
+            fixture.router.unsubscribe(1, "stalled").await,
+            Err(crate::router::RouterError::UnknownSid("stalled".to_owned()))
+        );
+        assert_eq!(fixture.active.load(std::sync::atomic::Ordering::Relaxed), 0);
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_stalled_socket_write_before_its_operation_deadline() {
+        let mut fixture = SocketFixture::open().await;
+        Arc::get_mut(&mut fixture.config)
+            .unwrap()
+            .server
+            .asb_operation_timeout_ms = 60_000;
+        let (mut client, task) = fixture.connect(1).await;
+        client
+            .send(Message::text("SUB stalled ServiceStatus ServiceStatus"))
+            .await
+            .unwrap();
+        assert!(matches!(recv_parsed(&mut client).await, ServerOp::Ok));
+        fixture
+            .router
+            .publish(
+                "ServiceStatus",
+                "ServiceStatus",
+                &"x".repeat(16 * 1024 * 1024),
+            )
+            .await;
+        // One poll writes until TCP backpressure yields; cancellation must then
+        // interrupt that write rather than wait for its sixty-second deadline.
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        fixture.shutdown.cancel();
+        timeout(Duration::from_secs(2), task)
+            .await
+            .expect("shutdown must interrupt a stalled write")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            fixture.router.unsubscribe(1, "stalled").await,
+            Err(crate::router::RouterError::UnknownSid("stalled".to_owned()))
+        );
+        assert_eq!(fixture.active.load(std::sync::atomic::Ordering::Relaxed), 0);
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn bind_failure_after_asb_startup_clears_readiness_and_finishes_bounded_cleanup() {
+        let (cfg, schema) = test_config(0, None, &[]);
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = (*cfg).clone();
+        cfg.server.bind_addr = occupied.local_addr().unwrap();
+        let ready = Arc::new(AtomicBool::new(true));
+        let readiness = Arc::clone(&ready);
+        let task = native_runtime().spawn(async move {
+            let (zenoh_router, endpoint) = open_test_router().await;
+            cfg.server.zenoh_router = endpoint;
+            let result = super::run(
+                Arc::new(cfg),
+                schema,
+                Arc::new(Router::new()),
+                CancellationToken::new(),
+                Arc::new(AtomicU64::new(0)),
+                ready,
+            )
+            .await;
+            timeout(Duration::from_secs(2), zenoh_router.close())
+                .await
+                .unwrap()
+                .unwrap();
+            result
+        });
+        let result = timeout(Duration::from_secs(5), task)
+            .await
+            .expect("partial startup and ASB cleanup must be bounded")
+            .unwrap();
+        assert!(matches!(result, Err(super::ServerError::Bind(_))));
+        assert!(!readiness.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_unfinished_websocket_upgrade() {
+        let (port, shutdown, task) = spawn_server().await;
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .unwrap();
+        shutdown_server(shutdown, task).await;
+        let mut byte = [0];
+        let closed = timeout(Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .unwrap();
+        assert!(
+            matches!(closed, Ok(0) | Err(_)),
+            "unfinished upgrade must release its TCP connection"
+        );
+    }
+
     #[tokio::test]
     async fn handshake_timeout_closes_connection() {
         let (port, shutdown, handle) = spawn_server().await;
@@ -1364,7 +1834,7 @@ mod tests {
 
         let mut buf = vec![0_u8; 1024];
 
-        // Timeout is 10s. Wait up to 12s for the connection to be closed by the server.
+        // Default operation deadline is 5s; allow scheduling and ASB startup margin.
         let read_result = timeout(Duration::from_secs(12), stream.read(&mut buf))
             .await
             .expect("read should not exceed 12s timeout")
@@ -1372,7 +1842,7 @@ mod tests {
 
         assert_eq!(
             read_result, 0,
-            "expected immediate EOF after 10s handshake timeout"
+            "expected EOF after the configured handshake timeout"
         );
 
         shutdown_server(shutdown, handle).await;
@@ -1384,7 +1854,7 @@ mod tests {
 
         let mut ws = connect_with_owp(port).await;
 
-        // Timeout is 10s. Wait up to 12s for the connection to be closed by the server.
+        // Default operation deadline is 5s; allow scheduling and ASB startup margin.
         let msg_result = timeout(Duration::from_secs(12), ws.next())
             .await
             .expect("read should not exceed 12s timeout");

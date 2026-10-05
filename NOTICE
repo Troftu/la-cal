@@ -128,3 +128,33 @@ are ticket 19; the final typed client and relayed STOP remain later tickets.
     docs/typed-client-evidence.md: workspace/dev-test integration, API usage and
     executed evidence. fixtures/service-lifecycle-command*.json are independently
     specified from the pinned schema and retain its definition provenance.
+
+2026-10-05: Ticket 19 bounded server failure adaptation from the same selected
+SLEET revision e3c2d798a229766571ed7be1f5b28d2dcdb51868.
+  - crates/la-cal/src/router.rs (sleet/src/router.rs): replace overflow dropping
+    with connection failure/removal; invalidate queued deliveries by registration
+    lifetime; synchronously dispose connection-owned registrations through a Drop
+    guard on abort. Share finalization across unsubscribe and connection cleanup.
+    Preserve ordinary fan-out and topic/message/group selection; adapt overflow
+    tests and add stale-ID, abort and exact-capacity checks.
+  - crates/la-cal/src/server.rs (sleet/src/server.rs): 64-message nonblocking
+    outbound queue; bounded, cancellation-aware writes/handshake/closure; RAII
+    connection counts and registrations; stop admission/readiness and retain the
+    adapter's first failure through bounded connection/adapter cleanup. Add socket
+    overflow, task-abort, backpressure, partial-startup and shutdown checks; use
+    actual readiness in fixtures and dispose temporary fixture directories.
+  - crates/la-cal/src/config.rs (sleet/src/config.rs): separate configurable
+    cleanup deadline and router observation period, with validated defaults/ranges.
+  - crates/la-cal/src/main.rs (sleet/src/main.rs): await server cleanup even when
+    admin supervision fails first; bound admin cleanup and finish runtime shutdown
+    before returning an unsuccessful exit, including configuration/startup failures.
+  - Project-original crates/la-cal/src/asb.rs: periodic stable router-ZID
+    observation, irreversible infrastructure-failure latch, publication/ingress
+    terminal checks, and bounded startup/observer/subscriber/session cleanup.
+    Construct/resolve synchronous Zenoh operations in blocking workers and guard
+    SDK destruction off async threads, including late/canceled worker outputs.
+  - config/server.toml, crates/la-cal/tests/native_baseline.rs, README.md and
+    docs/server-failure-evidence.md: configuration/usage and executed evidence;
+    twelve reported invalid ingress cases with valid progress witnesses, retained
+    listener after client closure, actual slow-socket overflow and router-loss
+    checks with real native zenohd, process ownership and bounded cleanup.

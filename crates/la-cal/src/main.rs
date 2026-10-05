@@ -2,7 +2,8 @@
 //!
 //! Modified 2026-10-04 from SLEET e3c2d798a229766571ed7be1f5b28d2dcdb51868:
 //! project executable name; baseline transport behavior retained. See ../../../NOTICE.
-//! Modified 2026-10-05: real ASB startup/delivery and bounded runtime cleanup.
+//! Modified 2026-10-05: real ASB startup/delivery, await server cleanup on admin
+//! failure, and finish bounded runtime shutdown before returning a failure exit.
 //!
 //! Loads configuration and an OMS XSD schema at startup, then listens for
 //! WebSocket connections using the OWP subprotocol. Each connection performs
@@ -113,61 +114,42 @@ fn print_usage() {
 }
 
 /// Load and validate the server configuration.
-fn load_config(config_path: &str) -> Arc<config::Config> {
-    match config::load(std::path::Path::new(config_path)) {
-        Ok(cfg) => {
-            // Delay tracing until telemetry is initialized, but we want to log the
-            // resolved UUIDs. We'll do it later in main().
-            Arc::new(cfg)
-        }
-        Err(e) => {
-            error!("configuration error: {e}");
-            std::process::exit(1);
-        }
-    }
+fn load_config(config_path: &str) -> Result<Arc<config::Config>, String> {
+    config::load(std::path::Path::new(config_path))
+        .map(Arc::new)
+        .map_err(|e| format!("configuration error: {e}"))
 }
 
 /// Install the final tracing subscriber using loaded configuration.
-fn init_configured_tracing(config: &config::Config) {
+fn init_configured_tracing(config: &config::Config) -> Result<(), String> {
     let log_format = if config.server.log_format == "json" {
         telemetry::LogFormat::Json
     } else {
         telemetry::LogFormat::Text
     };
 
-    if let Err(e) = telemetry::init_tracing(
+    telemetry::init_tracing(
         log_format,
         config.server.log_level.as_deref(),
         config.server.otlp_endpoint.as_deref(),
-    ) {
-        error!("tracing initialization error: {e}");
-        std::process::exit(1);
-    }
+    )
+    .map_err(|e| format!("tracing initialization error: {e}"))
 }
 
 /// Load and parse the configured UCI schema.
-fn load_schema(config: &config::Config) -> Arc<schema::model::Schema> {
-    match schema::parser::parse(&config.server.schema_path) {
-        Ok(schema) => {
-            if let Err(message) = validate_schema_version(&config.server.schema_version, &schema) {
-                error!("schema configuration error: {message}");
-                std::process::exit(1);
-            }
-
-            info!(
-                schema_version = schema.version.as_deref().unwrap_or(""),
-                elements = schema.global_elements.len(),
-                types = schema.complex_types.len(),
-                facets = schema.facet_count(),
-                "schema loaded"
-            );
-            Arc::new(schema)
-        }
-        Err(e) => {
-            error!("schema parse error: {e}");
-            std::process::exit(1);
-        }
-    }
+fn load_schema(config: &config::Config) -> Result<Arc<schema::model::Schema>, String> {
+    let schema = schema::parser::parse(&config.server.schema_path)
+        .map_err(|e| format!("schema parse error: {e}"))?;
+    validate_schema_version(&config.server.schema_version, &schema)
+        .map_err(|e| format!("schema configuration error: {e}"))?;
+    info!(
+        schema_version = schema.version.as_deref().unwrap_or(""),
+        elements = schema.global_elements.len(),
+        types = schema.complex_types.len(),
+        facets = schema.facet_count(),
+        "schema loaded"
+    );
+    Ok(Arc::new(schema))
 }
 
 /// Verify the configured schema version matches the loaded XSD declaration.
@@ -314,6 +296,7 @@ async fn run_until_shutdown(
     ready: Arc<AtomicBool>,
     admin_task: Option<tokio::task::JoinHandle<Result<(), admin::AdminError>>>,
 ) -> Result<(), String> {
+    let cleanup_deadline = std::time::Duration::from_millis(config.server.asb_cleanup_timeout_ms);
     let mut server_task = tokio::spawn(server::run(
         config,
         schema,
@@ -331,20 +314,25 @@ async fn run_until_shutdown(
         server_result = &mut server_task => {
             let server_outcome = flatten_server_result(server_result);
             shutdown.cancel();
-            let admin_outcome = flatten_admin_result(admin_task.await);
+            let admin_outcome = if let Ok(result) = tokio::time::timeout(cleanup_deadline, &mut admin_task).await {
+                flatten_admin_result(result)
+            } else {
+                admin_task.abort();
+                let _ = tokio::time::timeout(cleanup_deadline, admin_task).await;
+                Err("admin listener cleanup deadline".to_owned())
+            };
             server_outcome.and(admin_outcome)
         }
         admin_result = &mut admin_task => {
-            let admin_outcome = flatten_admin_result(admin_result);
-            if admin_outcome.is_err() || !shutdown.is_cancelled() {
-                shutdown.cancel();
-                return match admin_outcome {
-                    Ok(()) => Err("admin listener exited unexpectedly".to_owned()),
-                    Err(message) => Err(message),
-                };
+            let mut admin_outcome = flatten_admin_result(admin_result);
+            if admin_outcome.is_ok() && !shutdown.is_cancelled() {
+                admin_outcome = Err("admin listener exited unexpectedly".to_owned());
             }
-
-            flatten_server_result(server_task.await)
+            shutdown.cancel();
+            // The server owns bounded connection and adapter cleanup. Await it
+            // even when the admin listener was the first task to fail.
+            let server_outcome = flatten_server_result(server_task.await);
+            admin_outcome.and(server_outcome)
         }
     }
 }
@@ -390,46 +378,51 @@ async fn shutdown_signal(token: CancellationToken) {
     }
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("create native server runtime");
-    runtime.block_on(async_main());
+    let mut cleanup_deadline = std::time::Duration::from_secs(5);
+    let outcome = runtime.block_on(async_main(&mut cleanup_deadline));
     // Started blocking work is not cancellable. Never wait for it indefinitely
     // during process shutdown; the process owner bounds any remaining lifetime.
-    runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+    runtime.shutdown_timeout(cleanup_deadline);
+    match outcome {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
-async fn async_main() {
+async fn async_main(cleanup_deadline: &mut std::time::Duration) -> Result<(), String> {
     let cli_action = match parse_cli_args(std::env::args(), |k| std::env::var(k)) {
         Ok(action) => action,
         Err(message) => {
-            eprintln!("{message}");
             print_usage();
-            std::process::exit(1);
+            return Err(message);
         }
     };
 
     let CliAction::Run { config_path } = cli_action else {
         match cli_action {
-            CliAction::HealthCheck { port } => match run_health_check(port) {
-                Ok(()) => return, // exit 0
-                Err(message) => {
-                    eprintln!("health check failed: {message}");
-                    std::process::exit(1);
-                }
-            },
+            CliAction::HealthCheck { port } => {
+                return run_health_check(port)
+                    .map_err(|message| format!("health check failed: {message}"));
+            }
             CliAction::Help => print_usage(),
             CliAction::Version => println!("{}", env!("CARGO_PKG_VERSION")),
             CliAction::Run { .. } => unreachable!("run action handled above"),
         }
-        return;
+        return Ok(());
     };
 
     let bootstrap_guard = telemetry::init_bootstrap();
-    let config = load_config(&config_path);
-    init_configured_tracing(&config);
+    let config = load_config(&config_path)?;
+    *cleanup_deadline = std::time::Duration::from_millis(config.server.asb_cleanup_timeout_ms);
+    init_configured_tracing(&config)?;
     drop(bootstrap_guard);
 
     info!(
@@ -438,25 +431,19 @@ async fn async_main() {
         "resolved OMS identity UUIDs"
     );
 
-    let schema = load_schema(&config);
+    let schema = load_schema(&config)?;
     let active_connections = Arc::new(AtomicU64::new(0));
     let ready = Arc::new(AtomicBool::new(false));
     let admin_state =
         make_admin_state(&config, Arc::clone(&active_connections), Arc::clone(&ready));
-    let metrics_handle = match install_metrics(&config) {
-        Ok(handle) => handle,
-        Err(message) => {
-            error!("{message}");
-            std::process::exit(1);
-        }
-    };
+    let metrics_handle = install_metrics(&config)?;
     let router = Arc::new(router::Router::new());
     let shutdown = CancellationToken::new();
 
     tokio::spawn(shutdown_signal(shutdown.clone()));
     let admin_task = spawn_admin_listener(&config, admin_state, metrics_handle, &shutdown);
 
-    if let Err(message) = run_until_shutdown(
+    run_until_shutdown(
         config,
         schema,
         router,
@@ -465,13 +452,10 @@ async fn async_main() {
         ready,
         admin_task,
     )
-    .await
-    {
-        error!("{message}");
-        std::process::exit(1);
-    }
+    .await?;
 
     info!("shutdown complete");
+    Ok(())
 }
 
 #[cfg(test)]
