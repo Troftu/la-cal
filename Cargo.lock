@@ -1415,6 +1415,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "la-cal-client",
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-process",
@@ -1439,6 +1440,18 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "zenoh",
+]
+
+[[package]]
+name = "la-cal-client"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "owp-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

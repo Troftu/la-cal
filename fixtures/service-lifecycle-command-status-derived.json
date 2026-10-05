@@ -1,0 +1,32 @@
+{
+  "ServiceLifecycleCommandStatus": {
+    "SecurityInformation": {
+      "Classification": "U",
+      "OwnerProducer": [{ "GovernmentIdentifier": "USA" }]
+    },
+    "MessageHeader": {
+      "SystemID": { "UUID": "123e4567-e89b-12d3-a456-426614174000" },
+      "Timestamp": "2026-10-05T00:00:00Z",
+      "SchemaVersion": "002.5.0",
+      "Mode": "LIVE",
+      "ServiceID": { "UUID": "123e4567-e89b-12d3-a456-426614174002" }
+    },
+    "MessageData": {
+      "CommandID": { "UUID": "123e4567-e89b-12d3-a456-426614174010" },
+      "CommandProcessingState": "REJECTED",
+      "LifecycleCommandStatus": "FAIL",
+      "ServiceID": { "UUID": "123e4567-e89b-12d3-a456-426614174002" },
+      "CommandProcessingStateReason": {
+        "$type": "UnallocatedReasonType",
+        "Reason": "CONSTRAINT_TIME",
+        "Description": "Observation deadline expired",
+        "SystemID": { "UUID": "123e4567-e89b-12d3-a456-426614174000" },
+        "AssociatedID": {
+          "$type": "TaskPlanID_Type",
+          "UUID": "123e4567-e89b-12d3-a456-426614174030",
+          "Version": 7
+        }
+      }
+    }
+  }
+}

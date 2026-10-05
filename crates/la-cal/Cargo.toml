@@ -48,6 +48,7 @@ zenoh = { version = "1.10.1", default-features = false, features = ["transport_t
 prost-build = "0.14.4"
 
 [dev-dependencies]
+la-cal-client = { path = "../la-cal-client" }
 sleet-client = { package = "baseline-client", path = "../baseline-client" }
 tempfile = "3"
 

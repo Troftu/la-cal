@@ -1,6 +1,6 @@
 # Native Rust LA-CAL prototype
 
-The project-owned SLEET-derived server (tickets 14–16) runs on native macOS:
+The project-owned SLEET-derived server and typed Rust client (tickets 14–17) run on native macOS:
 an authorized OWP Client negotiates `owp` / OWP 1.0, subscribes, publishes a
 validated UCI 002.5.0 `ServiceStatus`, observes `+OK` and receives the original
 JSON in `MSG` through the real Zenoh/Protobuf ASB subscriber. Only ASB ingress
@@ -69,6 +69,8 @@ from the pinned schema rather than a generated serialization expectation.
 cargo check --locked --workspace --all-targets
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets
+cargo test --locked -p la-cal-client --test owp_peer
+cargo test --locked -p la-cal-client --doc
 python3 -B scripts/generate_uci_types.py --self-test
 SLEET_SCHEMA_PATH="$PWD/spec/002.5.0/UCI_MessageDefinitions_v2_5_0.xsd" cargo test --locked --workspace
 ```
@@ -79,6 +81,65 @@ name is retained for the baseline. Ordinary builds use checked-in bindings.
 Explicit regeneration and separate UCI terms are documented in
 [`spec/002.5.0/PROVENANCE.md`](spec/002.5.0/PROVENANCE.md).
 
+## Typed Rust client
+
+Depend on `la-cal-client` and use the generated global roots in
+`la_cal_client::messages::uci_002_5`. `ServiceLifecycleCommand`,
+`ServiceLifecycleCommandStatus` and `ServiceStatus` each wrap the complete body
+in a public `message` field. Their generated Serde implementations and `Message`
+metadata supply the OMS JSON root, topic and fixed UCI 002.5.0 profile. Body and
+dependency types are available for construction but are not publishable roots.
+
+```rust,no_run
+use futures_util::StreamExt;
+use la_cal_client::{Client, ClientConfig, messages::uci_002_5::ServiceStatus};
+
+async fn exchange(report: ServiceStatus) -> Result<(), Box<dyn std::error::Error>> {
+    let client = Client::connect(ClientConfig::new(
+        "ws://127.0.0.1:9000/", "baseline-tester",
+    )).await?;
+    let mut reports = client.subscribe::<ServiceStatus>().await?;
+    client.clone().send(&report).await?;
+    if let Some(item) = reports.next().await {
+        println!("{:?}", item?.message.message_data.service_state);
+    }
+    reports.close().await?;
+    client.close().await?;
+    Ok(())
+}
+```
+
+`ClientConfig` supplies the plain loopback endpoint, authorized OWP participant
+and connection/operation/close deadlines, each defaulting to five seconds.
+Connect awaits `owp` negotiation, verbose INIT acknowledgment and OWP 1.0 INFO.
+INFO has no schema member in Rev B: successful INIT accepts the requested
+002.5.0 profile. Communications readiness is separate from application NORMAL.
+
+Clones share one connection. Concurrent calls queue PUB/SUB/UNSUB with one
+transmitted pending acknowledgment, while MSG and WebSocket controls remain live.
+Send success means OWP publication completion; server errors retain their exact
+code/details. Connection failures distinguish protocol, transport and deadlines,
+and record whether transmission was attempted (a sent publication can be uncertain).
+
+Every subscribe owns its own OWP registration and persistent
+`Stream<Item = Result<T, ReceiveError>>`, including repeated subscriptions to the
+same type. Typed decoding errors are nonterminal; malformed protocol and unexpected
+loss produce a terminal connection error before stream end. Applications own
+processing and response matching. Delivery uses simple private unbounded channels;
+application polling cannot block acknowledgment handling, and no receive-loss or
+configurable overflow contract is established.
+
+Subscription `close(self).await` consumes its stream and awaits only its UNSUB.
+Drop stops local reception and requests best-effort cleanup. Ordinary client-clone
+drop leaves other owners usable; explicit `close().await` through any clone closes
+the shared connection. The implementation retains transmitted-operation ownership
+and bounded drain hooks for ticket 18's detailed cancellation/deadline/closure work.
+
+The native process test also exchanges all three typed roots and a polymorphic
+diagnostic fixture, independently observes the corresponding Zenoh envelopes,
+and verifies repeated registrations and explicit cleanup. See
+[`docs/typed-client-evidence.md`](docs/typed-client-evidence.md) for executed checks.
+
 ## Workspace and milestone
 
 | Package | Purpose at this milestone |
@@ -86,9 +147,10 @@ Explicit regeneration and separate UCI terms are documented in
 | `la-cal` | Adopted OWP frontend, fixed three-root topic policy, authorization, Zenoh/Protobuf ASB, local subscription/groups, direct Rust validator and admin/telemetry |
 | `owp-types` | Adopted OWP grammar/types and baseline UCI bindings/tests |
 | `baseline-client` | Unmodified upstream-style client used by copied socket tests; temporary adoption support |
+| `la-cal-client` | Cloneable async typed client, independent subscription streams and checked-in UCI 002.5.0 roots/dependencies |
 
-The final cloneable typed `la-cal-client` and relayed STOP applications are
-subsequent tickets. Ticket 19 completes detected-router-loss failure and bounded
+Ticket 18 completes detailed client cancellation/deadline/drain verification;
+the relayed STOP applications remain subsequent tickets. Ticket 19 completes detected-router-loss failure and bounded
 server queue behavior; the inherited 1024-message/drop-on-overflow queue remains.
 It is source-adoption evidence, not final prototype acceptance or a conformance
 claim. Plain `ws` retains the explicit RFC 6455 §10.6 TLS-capability exception.

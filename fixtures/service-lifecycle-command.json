@@ -1,0 +1,23 @@
+{
+  "ServiceLifecycleCommand": {
+    "SecurityInformation": {
+      "Classification": "U",
+      "OwnerProducer": [{ "GovernmentIdentifier": "USA" }]
+    },
+    "MessageHeader": {
+      "SystemID": { "UUID": "123e4567-e89b-12d3-a456-426614174000" },
+      "Timestamp": "2026-10-05T00:00:00Z",
+      "SchemaVersion": "002.5.0",
+      "Mode": "LIVE",
+      "ServiceID": { "UUID": "123e4567-e89b-12d3-a456-426614174001" }
+    },
+    "MessageData": {
+      "CommandID": { "UUID": "123e4567-e89b-12d3-a456-426614174010" },
+      "CommandState": "NEW",
+      "MissionID": { "UUID": "123e4567-e89b-12d3-a456-426614174020" },
+      "EffectingServiceID": { "UUID": "123e4567-e89b-12d3-a456-426614174002" },
+      "AffectedServiceID": [{ "UUID": "123e4567-e89b-12d3-a456-426614174002" }],
+      "LifecycleState": "STOP"
+    }
+  }
+}

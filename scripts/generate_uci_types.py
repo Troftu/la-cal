@@ -2,6 +2,8 @@
 """Discover and generate Rust helpers for the Sleet UCI v2.5 subset."""
 # Modified 2026-10-04 from SLEET e3c2d798a229766571ed7be1f5b28d2dcdb51868:
 # retain schema/generator provenance in emitted artifacts. See ../NOTICE.
+# Modified 2026-10-05: selected client roots, field-position derived-value
+# closure/dispatch and generated root/topic/profile metadata. See ../NOTICE.
 
 from __future__ import annotations
 
@@ -19,6 +21,7 @@ from typing import Iterable, Literal
 XS_NS = "http://www.w3.org/2001/XMLSchema"
 XS = f"{{{XS_NS}}}"
 DEFAULT_SCHEMA = Path("spec/002.5.0/UCI_MessageDefinitions_v2_5_0.xsd")
+CLIENT_MESSAGES = ("ServiceLifecycleCommand", "ServiceLifecycleCommandStatus", "ServiceStatus")
 
 TARGET_MESSAGES: tuple[str, ...] = (
     "PositionReport",
@@ -341,6 +344,7 @@ class RustGenerator:
 
     index: SchemaIndex
     discovery: DiscoveryResult
+    client: bool = False
 
     def render(self) -> str:
         """Render the discovered UCI subset as Rust source."""
@@ -349,7 +353,7 @@ class RustGenerator:
             "//! Provide generated UCI v2.5 helper types for the supported UCI message subset.",
             "//!",
             "//! This file is generated from the local UCI v2.5 XSD subset.",
-            "//! Generator: scripts/generate_uci_types.py, adapted 2026-10-04 from",
+            "//! Generator: scripts/generate_uci_types.py, adapted 2026-10-04/05 from",
             "//! SLEET e3c2d798a229766571ed7be1f5b28d2dcdb51868 (Apache-2.0).",
             "//! Schema: UCI 002.5.0, revision 73a286fc4b881d9f328dbd64148525606a92c33a.",
             "//! UCI artifacts retain separate Government Owned terms; see LICENSES/uci-schema.",
@@ -368,8 +372,70 @@ class RustGenerator:
         for name in self.discovery.complex_types:
             decl = self.index.complex_types[name]
             lines.extend(self.render_complex_type(decl))
-        lines.extend(self.render_uci_message_enum())
+        if self.client:
+            for name in self.polymorphic_fields():
+                lines.extend(self.render_polymorphic(name))
+            lines.extend(self.render_client_roots())
+        else:
+            lines.extend(self.render_uci_message_enum())
         return "\n".join(lines).rstrip() + "\n"
+
+    def descendants(self, name: str) -> list[str]:
+        """Return concrete legal extension values, restricted to this closure."""
+        return sorted(n for n in self.discovery.complex_types
+                      if n != name and not self.index.complex_types[n].abstract
+                      and is_derived(self.index, n, name))
+
+    def polymorphic_fields(self) -> list[str]:
+        """Only element positions, not inheritance edges, admit derived values."""
+        names = {e.type_name for n in self.discovery.complex_types
+                 for e in self.index.complex_types[n].elements}
+        return sorted(n for n in names if n in self.index.complex_types and self.descendants(n))
+
+    def render_polymorphic(self, name: str) -> list[str]:
+        """Emit lossless typed dispatch with an optional declared-type tag."""
+        enum = rust_type_name(name) + "Value"
+        concrete = ([] if self.index.complex_types[name].abstract else [name]) + self.descendants(name)
+        lines = [f"/// A value in a `{name}` element position, including legal derived types.",
+                 "#[derive(Debug, Clone, PartialEq)]", f"pub enum {enum} {{"]
+        for n in concrete:
+            lines += [f"    /// Carry `{n}`.", f"    {rust_type_name(n)}({rust_type_name(n)}),"]
+        lines += ["}", f"impl Serialize for {enum} {{",
+                  "    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {",
+                  "        let (mut value, tag) = match self {"]
+        for n in concrete:
+            lines += [f"            Self::{rust_type_name(n)}(inner) => (serde_json::to_value(inner).map_err(serde::ser::Error::custom)?, {rust_string(n)}),"]
+        lines += ["        };", f"        if tag != {rust_string(name)} {{",
+                  '            value.as_object_mut().ok_or_else(|| serde::ser::Error::custom("expected object"))?.insert("$type".into(), tag.into());',
+                  "        }", "        value.serialize(serializer)", "    }", "}",
+                  f"impl<'de> Deserialize<'de> for {enum} {{",
+                  "    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {",
+                  "        let mut value = serde_json::Value::deserialize(deserializer)?;",
+                  '        let tag = value.as_object_mut().ok_or_else(|| serde::de::Error::custom("expected object"))?.remove("$type");',
+                  f"        let tag = match &tag {{ None => {rust_string(name)}, Some(serde_json::Value::String(s)) => s.as_str(), _ => return Err(serde::de::Error::custom(\"$type must be a string\")) }};",
+                  "        match tag {"]
+        for n in concrete:
+            lines += [f"            {rust_string(n)} => serde_json::from_value(value).map(Self::{rust_type_name(n)}).map_err(serde::de::Error::custom),"]
+        lines += ['            _ => Err(serde::de::Error::custom(format!("illegal derived type {tag}"))),',
+                  "        }", "    }", "}", ""]
+        return lines
+
+    def render_client_roots(self) -> list[str]:
+        lines = []
+        for target in self.discovery.targets:
+            name = target.name
+            lines += [f"/// Publishable OMS JSON `{name}` global root.",
+                      "#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]",
+                      "#[serde(deny_unknown_fields)]", f"pub struct {name} {{",
+                      "    /// Complete message body, including security and header.",
+                      f"    #[serde(rename = {rust_string(name)})]",
+                      f"    pub message: {rust_type_name(target.type_name)},", "}",
+                      f"impl crate::sealed::Sealed for {name} {{}}",
+                      f"impl crate::Message for {name} {{",
+                      f"    const ROOT: &'static str = {rust_string(name)};",
+                      f"    const TOPIC: &'static str = {rust_string(name)};",
+                      '    const PROFILE: &\'static str = "002.5.0";', "}", ""]
+        return lines
 
     def render_uci_message_enum(self) -> list[str]:
         """Render the top-level UciMessage enum for all target messages."""
@@ -470,6 +536,8 @@ class RustGenerator:
             )
         )
         lines.append("#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]")
+        if self.client and choice is None:
+            lines.append("#[serde(deny_unknown_fields)]")
         if not fields and choice is None:
             lines.append(f"pub struct {rust_type_name(decl.name)} {{}}")
             lines.append("")
@@ -616,6 +684,8 @@ class RustGenerator:
     def rust_type_for_element(self, element: ElementDecl) -> str:
         """Return the Rust type used for an XSD element occurrence."""
         base_type = self.rust_type_for_type_name(element.type_name)
+        if self.client and element.type_name in self.polymorphic_fields():
+            base_type += "Value"
         if element.is_repeated:
             return f"Vec<{base_type}>"
         if element.is_optional:
@@ -648,6 +718,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse command-line arguments for discovery, generation, and validation."""
     parser = argparse.ArgumentParser(
         description="Discover or generate Rust for the transitive UCI v2.5 XSD type closure used by Sleet helper messages.",
+    )
+    parser.add_argument(
+        "--client", action="store_true",
+        help="Generate the selected three roots, derived-value dependencies and typed client metadata.",
     )
     parser.add_argument(
         "--schema",
@@ -890,6 +964,7 @@ def parse_simple_type(element: ET.Element, source: Path) -> SimpleTypeDecl | Non
 def discover_type_closure(
     index: SchemaIndex,
     target_messages: Iterable[str] = TARGET_MESSAGES,
+    *, polymorphic: bool = False,
 ) -> DiscoveryResult:
     """Discover all named types reachable from the configured target messages."""
     targets = resolve_target_messages(index, target_messages)
@@ -918,6 +993,9 @@ def discover_type_closure(
             )
             queue.extend(complex_decl.base_types)
             queue.extend(complex_decl.element_types)
+            if polymorphic:
+                for field_type in complex_decl.element_types:
+                    queue.extend(n for n in index.complex_types if is_derived(index, n, field_type))
             continue
 
         simple_decl = index.simple_types.get(type_name)
@@ -953,6 +1031,16 @@ def discover_type_closure(
         unresolved_types=tuple(sorted(unresolved_types)),
         parsed_files=tuple(index.parsed_files),
     )
+
+
+def is_derived(index: SchemaIndex, name: str, base: str) -> bool:
+    """Whether a complex type extends the expected element type transitively."""
+    parent = index.complex_types[name].base_type
+    while parent in index.complex_types:
+        if parent == base:
+            return True
+        parent = index.complex_types[parent].base_type
+    return False
 
 
 def resolve_target_messages(
@@ -1341,14 +1429,17 @@ def main(argv: list[str] | None = None) -> int:
         return run_self_tests(args.schema)
 
     index = load_schema_index(args.schema)
-    result = discover_type_closure(index)
+    if args.client and ET.parse(args.schema).getroot().get("version") != "002.5.0":
+        raise SystemExit("client generation requires pinned UCI 002.5.0 inputs")
+    result = discover_type_closure(index, CLIENT_MESSAGES if args.client else TARGET_MESSAGES,
+                                   polymorphic=args.client)
     if result.unresolved_types:
         names = ", ".join(result.unresolved_types)
         print(f"unresolved non-built-in type references: {names}", file=sys.stderr)
         return 1
 
     output = (
-        RustGenerator(index, result).render()
+        RustGenerator(index, result, client=args.client).render()
         if args.generate_rust
         else render_discovery_report(result)
     )

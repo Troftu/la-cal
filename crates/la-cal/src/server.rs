@@ -7,6 +7,8 @@
 //! See ../../../NOTICE.
 //! Modified 2026-10-05: ASB startup gate, subscriber-only delivery and independent
 //! connection I/O while an adapter publication is pending.
+//! Modified 2026-10-05 (ticket 17): flush the automatic WebSocket close reply
+//! before releasing the transport; verified through deployed typed client close.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -503,7 +505,13 @@ async fn connection_loop(
                         awaiting_pong = false;
                         last_activity = time::Instant::now();
                     }
-                    Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                    Some(Ok(Message::Close(_))) => {
+                        // Tungstenite queues the close reply while reading. Dropping
+                        // without flushing resets a correctly closing client's socket.
+                        let _ = time::timeout(Duration::from_secs(5), ws.flush()).await;
+                        break;
+                    }
+                    Some(Err(_)) | None => break,
                 }
             }
         }

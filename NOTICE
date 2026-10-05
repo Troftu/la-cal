@@ -100,3 +100,31 @@ not implement the selected Zenoh/Protobuf ASB or final typed client contract.
 The ASB milestone retains the inherited local registration/group selection and
 outbound queue behavior. Detected router-loss latching and close-on-overflow
 are ticket 19; the final typed client and relayed STOP remain later tickets.
+
+2026-10-05: Ticket 17 typed client and generator adaptation.
+  - scripts/generate_uci_types.py, adapted from the same selected SLEET revision:
+    preserve baseline root selection/self-tests; add explicit --client generation
+    of the three selected 002.5.0 roots, conservative field-position derived-value
+    closure, strict body/root codecs, typed derived dispatch retaining $type and
+    derived-only fields, and sealed root/topic/profile metadata. Reject a different
+    schema version for client generation.
+  - crates/la-cal-client/src/messages/uci_002_5.rs: explicitly generated from the
+    pinned Main/SecurityMarkings XSDs. Contains 306 complex and 35 simple dependent
+    types and the three publishable global wrappers. UCI data definitions preserve
+    their separate Government Owned artifact terms, not an Apache-2.0 relicensing.
+    Provenance, hashes and regeneration are in spec/002.5.0/PROVENANCE.md.
+  - crates/la-cal/src/server.rs (sleet/src/server.rs): repair an inherited close
+    handshake defect obstructing the deployed client run. Flush Tungstenite's
+    automatic close reply with a bounded wait before dropping the socket.
+  - crates/la-cal/tests/native_baseline.rs: retain existing OWP/ASB checks; extend
+    the real binary/router exchange with typed sends/streams for all three roots,
+    independent repeated registrations, explicit cleanup, polymorphic data fidelity
+    and independently decoded Zenoh envelopes without cross-root arrival ordering.
+  - Project-original additions: crates/la-cal-client/Cargo.toml, src/lib.rs,
+    src/connection.rs, src/messages/mod.rs and tests/owp_peer.rs implement the
+    approved public client, shared operation attribution, independent streams and
+    behavioral peer checks. They are not copied from SLEET's baseline client.
+  - Cargo.toml/Cargo.lock, crates/la-cal/Cargo.toml, README.md and
+    docs/typed-client-evidence.md: workspace/dev-test integration, API usage and
+    executed evidence. fixtures/service-lifecycle-command*.json are independently
+    specified from the pinned schema and retain its definition provenance.

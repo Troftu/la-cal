@@ -1,10 +1,15 @@
 //! Native process/OWP and Zenoh boundary evidence (tickets 14–16).
+//! Extended 2026-10-05: ticket 17 typed client exchange for all selected roots.
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use la_cal_client::{
+    Client, ClientConfig,
+    messages::uci_002_5::{ServiceLifecycleCommand, ServiceLifecycleCommandStatus, ServiceStatus},
+};
 use prost::Message as _;
 use sleet_types::owp::{OwpError, ServerOp, parse_server};
 use tokio::time::{sleep, timeout};
@@ -209,6 +214,39 @@ async fn native_process_negotiates_validates_and_delivers_service_status() {
     .await
     .expect("bounded OWP exchange");
     samples.undeclare().await.unwrap();
+    let samples = observer
+        .declare_subscriber("la-cal/uci/002.5.0/*")
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        let client = Client::connect(ClientConfig::new(format!("ws://{addr}/"), "baseline-tester")).await.unwrap();
+        let commands = include_str!("../../../fixtures/service-lifecycle-command.json");
+        let results = include_str!("../../../fixtures/service-lifecycle-command-status.json");
+        typed_exchange::<ServiceLifecycleCommand>(&client, commands).await;
+        typed_exchange::<ServiceLifecycleCommandStatus>(&client, results).await;
+        typed_exchange::<ServiceStatus>(&client, &fixture).await;
+        let expected = [("ServiceLifecycleCommand", commands), ("ServiceLifecycleCommandStatus", results), ("ServiceStatus", fixture.as_str())];
+        let mut counts = [0; 3];
+        for _ in 0..6 {
+            let sample = samples.recv_async().await.unwrap();
+            let index = expected.iter().position(|(root, _)| sample.key_expr().as_str() == format!("la-cal/uci/002.5.0/{root}")).expect("selected exact ASB key");
+            counts[index] += 1;
+            let envelope = Envelope::decode(sample.payload().to_bytes().as_ref()).unwrap();
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&envelope.oms_json).unwrap(), serde_json::from_str::<serde_json::Value>(expected[index].1).unwrap());
+        }
+        assert_eq!(counts, [2, 2, 2], "both typed publications of every root traverse the adapter");
+        let derived = include_str!("../../../fixtures/service-lifecycle-command-status-derived.json");
+        typed_exchange::<ServiceLifecycleCommandStatus>(&client, derived).await;
+        for _ in 0..2 {
+            let sample = samples.recv_async().await.unwrap();
+            assert_eq!(sample.key_expr().as_str(), "la-cal/uci/002.5.0/ServiceLifecycleCommandStatus");
+            let envelope = Envelope::decode(sample.payload().to_bytes().as_ref()).unwrap();
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&envelope.oms_json).unwrap(), serde_json::from_str::<serde_json::Value>(derived).unwrap(), "derived type tags, Version and SystemID survive actual adapter traversal");
+        }
+        client.close().await.unwrap();
+        println!("native typed client: all three roots / real Zenoh envelopes / independent repeated subscriptions and explicit UNSUB");
+    }).await.expect("bounded deployed typed-client exchange");
+    samples.undeclare().await.unwrap();
     observer.close().await.unwrap();
     let signal = Command::new("kill")
         .args(["-TERM", &server.0.id().to_string()])
@@ -226,6 +264,27 @@ async fn native_process_negotiates_validates_and_delivers_service_status() {
     })
     .await
     .expect("bounded graceful server shutdown");
+}
+
+async fn typed_exchange<T: la_cal_client::Message>(client: &Client, fixture: &str) {
+    let expected: serde_json::Value = serde_json::from_str(fixture).unwrap();
+    let message: T = serde_json::from_str(fixture).unwrap();
+    let mut first = client.subscribe::<T>().await.unwrap();
+    let mut second = client.subscribe::<T>().await.unwrap();
+    client.send(&message).await.unwrap();
+    for delivered in [
+        first.next().await.unwrap().unwrap(),
+        second.next().await.unwrap().unwrap(),
+    ] {
+        assert_eq!(serde_json::to_value(delivered).unwrap(), expected);
+    }
+    first.close().await.unwrap();
+    client.send(&message).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(second.next().await.unwrap().unwrap()).unwrap(),
+        expected
+    );
+    second.close().await.unwrap();
 }
 
 async fn assert_topic_policy(
