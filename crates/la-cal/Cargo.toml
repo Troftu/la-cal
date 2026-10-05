@@ -1,5 +1,6 @@
 # Adapted from SLEET e3c2d798a229766571ed7be1f5b28d2dcdb51868, 2026-10-04.
 # Project paths/name and current stable dependencies; see ../../NOTICE.
+# Modified 2026-10-05: Zenoh/Protobuf ASB dependencies and build generation.
 [package]
 name = "la-cal"
 version = "0.1.0"
@@ -23,6 +24,7 @@ hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 metrics-process = "2.4.3"
+prost = "0.14.4"
 opentelemetry = { version = "0.33", optional = true }
 opentelemetry-otlp = { version = "0.33", optional = true, features = ["grpc-tonic"] }
 opentelemetry_sdk = { version = "0.33", optional = true, features = ["rt-tokio"] }
@@ -40,6 +42,10 @@ tracing = "0.1"
 tracing-opentelemetry = { version = "0.34", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["serde", "v5"] }
+zenoh = { version = "1.10.1", default-features = false, features = ["transport_tcp"] }
+
+[build-dependencies]
+prost-build = "0.14.4"
 
 [dev-dependencies]
 sleet-client = { package = "baseline-client", path = "../baseline-client" }

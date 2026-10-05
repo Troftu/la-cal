@@ -71,3 +71,32 @@ Keep prominent modification notices in the adapted source files as well.
 
 The topic-policy milestone still uses SLEET's in-process router. It does
 not implement the selected Zenoh/Protobuf ASB or final typed client contract.
+
+2026-10-05: Ticket 16 ASB adaptation from the same selected SLEET revision.
+  - crates/la-cal/src/server.rs (sleet/src/server.rs): gate OWP admission on
+    real router/session/subscriber readiness; move validation/publication into
+    an asynchronous adapter operation; keep WebSocket controls and subscriber
+    delivery active during pending publication; acknowledge only after adapter
+    completion. Local routing dispatch now originates only from ASB ingress.
+    Copied socket fixtures use actual Zenoh sessions with isolated embedded
+    loopback routers; protocol/group/cleanup assertions remain in place.
+  - crates/la-cal/src/config.rs (sleet/src/config.rs): configurable explicit
+    loopback TCP router endpoint and bounded startup/operation waits.
+  - crates/la-cal/src/main.rs (sleet/src/main.rs): register the project-owned
+    ASB module and bound runtime shutdown instead of joining blocking workers
+    indefinitely. Preserve existing signal/admin/frontend supervision.
+  - crates/la-cal/Cargo.toml (sleet/Cargo.toml), Cargo.lock: add stable Zenoh
+    TCP-only and prost/prost-build dependencies, without unstable Zenoh APIs
+    or a vendored Protobuf compiler.
+  - Project-original additions: crates/la-cal/src/asb.rs, oms_json.proto and
+    build.rs implement original-byte JSON envelopes, bounded offload, stable
+    router-ZID startup, one retained subscriber, ingress assessment/discard and
+    bounded subscriber/session cleanup. They are not copied SLEET components.
+  - config/zenoh-router.json5, config/server.toml, README.md and
+    crates/la-cal/tests/native_baseline.rs: native launch configuration and
+    evidence at real process/OWP/Zenoh boundaries, independent envelope oracle,
+    invalid-ingress checks, listener retention and bounded startup/shutdown.
+
+The ASB milestone retains the inherited local registration/group selection and
+outbound queue behavior. Detected router-loss latching and close-on-overflow
+are ticket 19; the final typed client and relayed STOP remain later tickets.

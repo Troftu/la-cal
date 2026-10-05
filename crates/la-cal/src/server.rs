@@ -5,8 +5,13 @@
 //! annotate inherited handler argument counts for current Clippy; enforce fixed
 //! topic/root pairs independently of optional bindings and adapt socket tests.
 //! See ../../../NOTICE.
+//! Modified 2026-10-05: ASB startup gate, subscriber-only delivery and independent
+//! connection I/O while an adapter publication is pending.
 
+use std::collections::VecDeque;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -26,15 +31,17 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
+use crate::asb::Adapter;
 use crate::config::{Config, SUPPORTED_TOPICS, ServiceConfig};
 use crate::router::{Router, RouterError, Subscription};
 use crate::schema::model::Schema;
-use crate::validator::validate_oms_json;
 use sleet_types::owp::{ClientOp, InfoPayload, InitPayload, OwpError, ServerOp};
 
 /// Fatal errors from [`run`].
 #[derive(Debug)]
 pub enum ServerError {
+    /// ASB startup or cleanup failed.
+    Asb(String),
     /// TCP bind failed on the configured address.
     Bind(std::io::Error),
 }
@@ -42,6 +49,7 @@ pub enum ServerError {
 impl fmt::Display for ServerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Asb(details) => write!(f, "ASB: {details}"),
             Self::Bind(source) => write!(f, "bind failed: {source}"),
         }
     }
@@ -58,6 +66,42 @@ pub async fn run(
     config: Arc<Config>,
     schema: Arc<Schema>,
     router: Arc<Router>,
+    shutdown: CancellationToken,
+    active_connections: Arc<AtomicU64>,
+    ready: Arc<AtomicBool>,
+) -> Result<(), ServerError> {
+    let adapter = Arc::new(
+        Adapter::open(
+            &config.server,
+            Arc::clone(&schema),
+            Arc::clone(&router),
+            shutdown.clone(),
+        )
+        .await
+        .map_err(ServerError::Asb)?,
+    );
+    let outcome = run_frontend(
+        config,
+        schema,
+        router,
+        &adapter,
+        shutdown,
+        active_connections,
+        ready,
+    )
+    .await;
+    let mut adapter = Arc::try_unwrap(adapter)
+        .map_err(|_| ServerError::Asb("adapter still owned after connection drain".to_owned()))?;
+    let cleanup = adapter.close().await.map_err(ServerError::Asb);
+    outcome.and(cleanup)
+}
+
+#[allow(clippy::too_many_arguments, clippy::significant_drop_tightening)]
+async fn run_frontend(
+    config: Arc<Config>,
+    schema: Arc<Schema>,
+    router: Arc<Router>,
+    adapter: &Arc<Adapter>,
     shutdown: CancellationToken,
     active_connections: Arc<AtomicU64>,
     ready: Arc<AtomicBool>,
@@ -94,6 +138,7 @@ pub async fn run(
                 let config = Arc::clone(&config);
                 let schema = Arc::clone(&schema);
                 let router = Arc::clone(&router);
+                let adapter = Arc::clone(adapter);
                 let next_conn_id = Arc::clone(&next_conn_id);
                 let conn_shutdown = shutdown.clone();
                 let active_connections = Arc::clone(&active_connections);
@@ -119,6 +164,7 @@ pub async fn run(
                             config,
                             schema,
                             router,
+                            adapter,
                             conn_id,
                             conn_shutdown,
                             active_connections,
@@ -245,19 +291,29 @@ enum ConnectionState {
 ///
 /// Multiplexes between reading client frames and delivering outbound MSG
 /// frames via `tokio::select!`. Cleans up subscriptions on disconnect.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     ws: WebSocketStream<TcpStream>,
     config: Arc<Config>,
     schema: Arc<Schema>,
     router: Arc<Router>,
+    adapter: Arc<Adapter>,
     connection_id: u64,
     shutdown: CancellationToken,
     active_connections: Arc<AtomicU64>,
 ) -> Result<(), String> {
     track_connection_opened(&active_connections);
 
-    let result =
-        connection_loop(ws, config, schema, router.as_ref(), connection_id, shutdown).await;
+    let result = connection_loop(
+        ws,
+        config,
+        schema,
+        router.as_ref(),
+        &adapter,
+        connection_id,
+        shutdown,
+    )
+    .await;
 
     router.remove_connection(connection_id).await;
     track_connection_closed(&active_connections);
@@ -265,16 +321,21 @@ async fn handle_connection(
     result
 }
 
+type PendingPublication = Pin<Box<dyn Future<Output = Result<(), (OwpError, String)>> + Send>>;
+
 #[allow(clippy::too_many_lines)]
 async fn connection_loop(
     mut ws: WebSocketStream<TcpStream>,
     config: Arc<Config>,
     schema: Arc<Schema>,
     router: &Router,
+    adapter: &Arc<Adapter>,
     connection_id: u64,
     shutdown: CancellationToken,
 ) -> Result<(), String> {
     let mut state = ConnectionState::AwaitingInit;
+    let mut publication: Option<PendingPublication> = None;
+    let mut queued_frames: VecDeque<String> = VecDeque::new();
     let (msg_tx, mut msg_rx) = mpsc::channel::<ServerOp>(1024);
     let idle_enabled = config.server.idle_timeout_seconds > 0;
     let idle_period = Duration::from_secs(config.server.idle_timeout_seconds.max(1));
@@ -284,7 +345,39 @@ async fn connection_loop(
     let mut init_timeout = Box::pin(time::sleep(Duration::from_secs(10)));
 
     loop {
+        if publication.is_none()
+            && let Some(text) = queued_frames.pop_front()
+        {
+            if handle_text_frame(
+                &mut ws,
+                &mut state,
+                &text,
+                &config,
+                Arc::clone(&schema),
+                router,
+                adapter,
+                &mut publication,
+                connection_id,
+                &msg_tx,
+            )
+            .await?
+            {
+                break;
+            }
+            continue;
+        }
         tokio::select! {
+            result = async { publication.as_mut().expect("pending publication").await }, if publication.is_some() => {
+                publication = None;
+                match result {
+                    Ok(()) => {
+                        if matches!(state, ConnectionState::Active { verbose: true, .. }) {
+                            send_server_op(&mut ws, ServerOp::Ok).await?;
+                        }
+                    }
+                    Err((error, details)) => send_err(&mut ws, error, details).await?,
+                }
+            }
             () = &mut init_timeout, if matches!(state, ConnectionState::AwaitingInit) => {
                 warn!("timeout waiting for INIT frame");
                 let close = Message::Close(Some(CloseFrame {
@@ -355,6 +448,13 @@ async fn connection_loop(
                         let keyword = text.split_ascii_whitespace().next().unwrap_or("<empty>");
                         debug!(operation = keyword, "recv");
 
+                        if publication.is_some() {
+                            if queued_frames.len() >= 64 {
+                                return Err("too many OWP operations queued during publication".to_owned());
+                            }
+                            queued_frames.push_back(text.to_string());
+                            continue;
+                        }
                         let should_fail = handle_text_frame(
                             &mut ws,
                             &mut state,
@@ -362,6 +462,8 @@ async fn connection_loop(
                             &config,
                             Arc::clone(&schema),
                             router,
+                            adapter,
+                            &mut publication,
                             connection_id,
                             &msg_tx,
                         ).await?;
@@ -438,6 +540,8 @@ async fn handle_text_frame(
     config: &Config,
     schema: Arc<Schema>,
     router: &Router,
+    adapter: &Arc<Adapter>,
+    publication: &mut Option<PendingPublication>,
     connection_id: u64,
     msg_tx: &mpsc::Sender<ServerOp>,
 ) -> Result<bool, String> {
@@ -451,6 +555,8 @@ async fn handle_text_frame(
                 *verbose,
                 schema,
                 router,
+                adapter,
+                publication,
                 connection_id,
                 msg_tx,
             )
@@ -519,6 +625,8 @@ async fn handle_active(
     verbose: bool,
     schema: Arc<Schema>,
     router: &Router,
+    adapter: &Arc<Adapter>,
+    publication: &mut Option<PendingPublication>,
     connection_id: u64,
     msg_tx: &mpsc::Sender<ServerOp>,
 ) -> Result<bool, String> {
@@ -540,7 +648,13 @@ async fn handle_active(
         }
         ClientOp::Pub { topic, payload } => {
             debug!(topic = %topic, "dispatch PUB");
-            process_pub(topic, payload, Arc::clone(service), schema, router).await
+            let service = Arc::clone(service);
+            let adapter = Arc::clone(adapter);
+            *publication = Some(Box::pin(async move {
+                process_pub(topic, payload, service, &adapter).await
+            }));
+            // The connection loop acknowledges only when the adapter completes.
+            return Ok(false);
         }
         ClientOp::Sub {
             sid,
@@ -657,13 +771,12 @@ fn process_init(
     Ok((service, payload.verbose.unwrap_or(true), info))
 }
 
-/// Process a PUB operation: authorize topic, parse JSON, validate against schema, route.
+/// Authorize PUB and await the adapter's validated publication operation.
 async fn process_pub(
     topic: String,
     raw_json: String,
     service: Arc<ServiceConfig>,
-    schema: Arc<Schema>,
-    router: &Router,
+    adapter: &Adapter,
 ) -> Result<(), (OwpError, String)> {
     let process_start = std::time::Instant::now();
 
@@ -677,64 +790,7 @@ async fn process_pub(
         ));
     }
 
-    let validation_result = tokio::task::spawn_blocking(move || {
-        let val_start = std::time::Instant::now();
-        let value: serde_json::Value = match serde_json::from_str(&raw_json) {
-            Ok(value) => value,
-            Err(e) => {
-                return Err((
-                    "invalid_json",
-                    OwpError::InvalidMessage,
-                    format!("invalid JSON payload: {e}"),
-                ));
-            }
-        };
-
-        if let serde_json::Value::Object(root) = &value
-            && root.len() == 1
-            && let Some((message_name, _)) = root.iter().next()
-            && !service.allows_message(&topic, message_name)
-        {
-            return Err((
-                "topic_binding",
-                OwpError::InvalidMessage,
-                format!("topic {topic} requires its identically named supported UCI 002.5.0 root; received {message_name}"),
-            ));
-        }
-
-        let res = match validate_oms_json(&schema, &value) {
-            Ok(validated) => Ok((validated, topic, raw_json)),
-            Err(e) => Err((
-                "schema_validation",
-                OwpError::InvalidMessage,
-                format!("schema validation failed: {e:?}"),
-            )),
-        };
-        metrics::histogram!("sleet_validation_duration_seconds")
-            .record(val_start.elapsed().as_secs_f64());
-        res
-    })
-    .await;
-
-    let (validated, topic, raw_json) = match validation_result {
-        Ok(Ok(success)) => success,
-        Ok(Err((category, error_code, details))) => {
-            metrics::counter!("sleet_validation_failures_total", "category" => category)
-                .increment(1);
-            return Err((error_code, details));
-        }
-        Err(e) => {
-            return Err((
-                OwpError::InternalError,
-                format!("validation task failed: {e}"),
-            ));
-        }
-    };
-
-    debug!(topic = %topic, message_name = %validated.message_name, "route PUB message");
-    router
-        .publish(&topic, &validated.message_name, &raw_json)
-        .await;
+    adapter.publish(topic.clone(), raw_json).await?;
     metrics::counter!("sleet_messages_published_total", "topic" => topic.clone()).increment(1);
     metrics::histogram!("sleet_message_processing_duration_seconds")
         .record(process_start.elapsed().as_secs_f64());
@@ -921,6 +977,57 @@ mod tests {
         Ok(listener.local_addr()?.port())
     }
 
+    // Zenoh requires a multi-thread scheduler. Keep the adopted tests' ordinary
+    // client runtimes while running their real router/server fixtures here.
+    fn native_runtime() -> &'static tokio::runtime::Runtime {
+        static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .expect("native ASB test runtime")
+        })
+    }
+
+    async fn run_test_server(
+        cfg: Arc<config::Config>,
+        schema: Arc<crate::schema::model::Schema>,
+        router: Arc<Router>,
+        shutdown: CancellationToken,
+        active_connections: Arc<AtomicU64>,
+        ready: Arc<AtomicBool>,
+    ) {
+        let port = pick_free_port().unwrap();
+        let router_config = zenoh::Config::from_json5(&format!(
+            r#"{{
+            mode: "router", listen: {{ endpoints: ["tcp/127.0.0.1:{port}"] }},
+            scouting: {{ multicast: {{ enabled: false }}, gossip: {{ enabled: false }} }}
+        }}"#
+        ))
+        .unwrap();
+        let zenoh_router = timeout(Duration::from_secs(5), zenoh::open(router_config))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut cfg = (*cfg).clone();
+        cfg.server.zenoh_router = format!("tcp/127.0.0.1:{port}");
+        super::run(
+            Arc::new(cfg),
+            schema,
+            router,
+            shutdown,
+            active_connections,
+            ready,
+        )
+        .await
+        .expect("real ASB-backed test server");
+        timeout(Duration::from_secs(2), zenoh_router.close())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     fn init_frame(service_id: &str) -> tokio_tungstenite::tungstenite::Utf8Bytes {
         init_frame_custom(service_id, &["1.0"], "002.5.0", None)
     }
@@ -1075,10 +1182,10 @@ mod tests {
 
         let shutdown = CancellationToken::new();
         let shutdown_for_server = shutdown.clone();
-        let handle = tokio::spawn(async move {
+        let handle = native_runtime().spawn(async move {
             let active_connections = Arc::new(AtomicU64::new(0));
             let ready = Arc::new(AtomicBool::new(false));
-            let _ = super::run(
+            run_test_server(
                 cfg,
                 schema,
                 router,
@@ -2377,10 +2484,11 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         let shutdown = tokio_util::sync::CancellationToken::new();
         let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readiness = Arc::clone(&ready);
 
         let shutdown_clone = shutdown.clone();
-        let handle = tokio::spawn(async move {
-            let _ = super::run(
+        let handle = native_runtime().spawn(async move {
+            run_test_server(
                 cfg,
                 schema,
                 router,
@@ -2391,7 +2499,14 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             .await;
         });
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        timeout(Duration::from_secs(5), async {
+            while !readiness.load(std::sync::atomic::Ordering::Relaxed) {
+                assert!(!handle.is_finished(), "test server exited before readiness");
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("bounded ASB-backed server readiness");
 
         let mut ws1 = connect_with_owp(port).await;
         init_verbose(&mut ws1, "svc1").await;

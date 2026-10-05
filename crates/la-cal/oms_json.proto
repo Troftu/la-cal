@@ -1,0 +1,8 @@
+syntax = "proto3";
+package la_cal.asb;
+
+// Project-defined ASB framing, not an official UCI Protobuf representation.
+message OmsJsonEnvelope {
+  // Complete original UTF-8 OMS JSON. Field number 1 is permanent.
+  bytes oms_json = 1;
+}

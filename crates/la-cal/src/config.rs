@@ -5,6 +5,7 @@
 //!
 //! Modified 2026-10-04 from SLEET e3c2d798a229766571ed7be1f5b28d2dcdb51868:
 //! enforce the selected three-root topic policy. See ../../../NOTICE.
+//! Modified 2026-10-05: loopback Zenoh endpoint and bounded adapter waits.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -30,6 +31,12 @@ pub const SUPPORTED_TOPICS: [&str; 3] = [
 /// Validated server-level configuration.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
+    /// Explicit loopback TCP router endpoint, with discovery disabled.
+    pub zenoh_router: String,
+    /// Per-operation adapter deadline, including blocking validation/publication.
+    pub asb_operation_timeout_ms: u64,
+    /// Deadline for session/router/subscriber startup and adapter cleanup.
+    pub asb_startup_timeout_ms: u64,
     /// Socket address to bind the TCP listener on.
     pub bind_addr: SocketAddr,
     /// Unique server identifier (OWP identifier format).
@@ -113,6 +120,8 @@ pub struct Config {
 /// Errors encountered while loading or validating configuration files.
 #[derive(Debug)]
 pub enum ConfigError {
+    /// Invalid ASB endpoint or deadline setting.
+    InvalidAsb { path: PathBuf, details: String },
     /// File I/O error (file not found, permission denied, etc.).
     Io {
         path: PathBuf,
@@ -175,6 +184,7 @@ impl fmt::Display for ConfigError {
     #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidAsb { path, details } => write!(f, "{}: {details}", path.display()),
             Self::Io { path, source } => {
                 write!(f, "{}: {source}", path.display())
             }
@@ -308,6 +318,9 @@ impl std::error::Error for ConfigError {}
 
 #[derive(Deserialize)]
 struct RawServerConfig {
+    zenoh_router: Option<String>,
+    asb_operation_timeout_ms: Option<u64>,
+    asb_startup_timeout_ms: Option<u64>,
     bind_addr: Option<String>,
     server_id: Option<String>,
     system_label: Option<String>,
@@ -556,7 +569,33 @@ fn load_server_with_env(
         });
     }
 
+    let zenoh_router = raw
+        .zenoh_router
+        .unwrap_or_else(|| "tcp/127.0.0.1:7447".to_owned());
+    let endpoint = zenoh_router
+        .strip_prefix("tcp/")
+        .and_then(|addr| addr.parse::<SocketAddr>().ok());
+    if !endpoint.is_some_and(|addr| addr.ip().is_loopback() && addr.port() != 0) {
+        return Err(ConfigError::InvalidAsb {
+            path: server_path.to_path_buf(),
+            details: "zenoh_router must be tcp/<loopback IP>:<nonzero port>".to_owned(),
+        });
+    }
+    let asb_operation_timeout_ms = raw.asb_operation_timeout_ms.unwrap_or(5_000);
+    let asb_startup_timeout_ms = raw.asb_startup_timeout_ms.unwrap_or(5_000);
+    if !(1..=60_000).contains(&asb_operation_timeout_ms)
+        || !(1..=60_000).contains(&asb_startup_timeout_ms)
+    {
+        return Err(ConfigError::InvalidAsb {
+            path: server_path.to_path_buf(),
+            details: "ASB timeouts must be in 1..=60000 milliseconds".to_owned(),
+        });
+    }
+
     Ok(ServerConfig {
+        zenoh_router,
+        asb_operation_timeout_ms,
+        asb_startup_timeout_ms,
         bind_addr,
         server_id,
         system_label,

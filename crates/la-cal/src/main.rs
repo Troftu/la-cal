@@ -2,6 +2,7 @@
 //!
 //! Modified 2026-10-04 from SLEET e3c2d798a229766571ed7be1f5b28d2dcdb51868:
 //! project executable name; baseline transport behavior retained. See ../../../NOTICE.
+//! Modified 2026-10-05: real ASB startup/delivery and bounded runtime cleanup.
 //!
 //! Loads configuration and an OMS XSD schema at startup, then listens for
 //! WebSocket connections using the OWP subprotocol. Each connection performs
@@ -9,6 +10,7 @@
 //! structural validation against the loaded schema.
 
 mod admin;
+mod asb;
 mod config;
 mod facets;
 mod router;
@@ -388,8 +390,18 @@ async fn shutdown_signal(token: CancellationToken) {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("create native server runtime");
+    runtime.block_on(async_main());
+    // Started blocking work is not cancellable. Never wait for it indefinitely
+    // during process shutdown; the process owner bounds any remaining lifetime.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+}
+
+async fn async_main() {
     let cli_action = match parse_cli_args(std::env::args(), |k| std::env::var(k)) {
         Ok(action) => action,
         Err(message) => {
